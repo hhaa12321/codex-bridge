@@ -2753,6 +2753,7 @@ test("stale writer status keeps Steer selection and submit controls available", 
   };
   const context = {
     state,
+    demoMode: false,
     $: element,
     document: { querySelector: () => element("shell") },
     tr: (key) => key,
@@ -2770,6 +2771,12 @@ test("stale writer status keeps Steer selection and submit controls available", 
   assert.equal(element("sendMode").value, "steer");
   assert.equal(element("sendModeToggle").disabled, false);
   assert.equal(element("submitBtn").disabled, false);
+  state.activeTurnId = null;
+  context.applyThreadWriterLock({ state: "unavailable", read_only: true });
+  assert.equal(element("relocateThreadBtn").disabled, false);
+  state.current = null;
+  context.applyThreadWriterLock({ state: "unavailable", read_only: true });
+  assert.equal(element("relocateThreadBtn").disabled, true);
 });
 
 test("a command timeout also covers a stalled response body", async () => {

@@ -6134,6 +6134,12 @@ function applyThreadWriterLock(lock) {
   );
   const readOnly = !currentThreadWritable();
   $("copySessionIdBtn").disabled = !state.current?.id;
+  $("relocateThreadBtn").disabled =
+    !state.current ||
+    draft ||
+    demoMode ||
+    Boolean(state.activeTurnId) ||
+    ["external", "released"].includes(stateName);
   document.querySelector(".composer-shell").classList.toggle("read-only", readOnly);
   for (const id of [
     "renameThreadBtn",
@@ -6438,6 +6444,22 @@ $("copySessionIdBtn").onclick = () =>
     if (!state.current?.id) throw new Error(tr("chooseSessionError"));
     await navigator.clipboard.writeText(state.current.id);
     notify(tr("sessionIdCopied"));
+  });
+$("relocateThreadBtn").onclick = () =>
+  run(async () => {
+    if (["external", "released"].includes(state.threadWriterLock?.state))
+      throw new Error(tr("sessionReadOnly"));
+    if (state.activeTurnId) throw new Error(tr("sessionBusy"));
+    const cwd = window.prompt(tr("relocateSessionPrompt"), state.current.cwd)?.trim();
+    if (!cwd || cwd === state.current.cwd) return;
+    const result = await command(targetRequest("thread_cwd_update", { cwd }), false);
+    state.current = { ...state.current, cwd: result.cwd, project_path: null, git_branch: null };
+    await loadProjects({ restoreSession: false });
+    await openThread(state.current, { quiet: true, preserveView: true });
+    await revealSessionProject(state.current);
+    notify(
+      tr(result.workspace_roots_applied ? "sessionRelocated" : "sessionRelocatedRootsUnverified"),
+    );
   });
 $("createSessionBtn").onclick = () => showCreateDialog();
 $("createProjectNextBtn").onclick = () => run(chooseCreateProject);

@@ -18,7 +18,8 @@ CODEX_BRIDGE_SOCKET=/path/to/control.sock codexctl status
 
 Read commands may use the selected task or the newest unarchived rollout. Write commands are more
 strict: `send`, `steer`, `interrupt`, and `host-exec` require either a prior `select` or an explicit
-global `--thread`. They never infer a write target from file modification time.
+global `--thread`. `relocate` requires an explicit `--thread`. They never infer a write target from
+file modification time.
 
 ```sh
 codexctl ls --limit 20
@@ -43,6 +44,7 @@ focus.
 | `current`             | Show the selected task, or the newest readable rollout | Implemented          |
 | `status`              | Show daemon, protocol, and rollout-store status        | Implemented          |
 | `show`                | Read user and assistant messages                       | Implemented          |
+| `relocate`            | Change an existing session's working directory         | Implemented          |
 | `send`                | Queue a new turn with `codex queue`                    | Implemented          |
 | `steer`               | Add guidance to the active turn through app-server     | Implemented          |
 | `interrupt`           | Interrupt the active turn through app-server           | Implemented          |
@@ -79,13 +81,24 @@ codexctl --thread <THREAD_ID> show --last 50
 
 `ls` and `show` read `$CODEX_HOME/sessions` and `session_index.jsonl` without resuming a task or
 taking writer ownership. Message reads keep only user and assistant messages, tolerate a rollout
-that is still being appended, and return the task's recorded working directory. The task list also
+that is still being appended, and return the session's current working directory. The task list also
 tries `git branch --show-current` in that directory; JSON uses `null` if the directory is gone, is
 not a Git repository, or is on a detached HEAD.
 
 `ls --json` and `current --json` include both `cwd` (the task's working directory) and
 `rollout_path` (the session JSONL file, when one exists). `codexctl` has no separate command to
 open the containing session directory.
+
+After moving a Chat workspace into an existing project directory, point its session at that
+directory before the next turn:
+
+```sh
+codexctl --thread <THREAD_ID> relocate /path/to/project
+```
+
+The directory must already exist and be absolute. The session must be idle, with no other
+app-server holding its writer. This changes where subsequent turns run and updates the project list; it
+does not move files. The same action is available in the Web UI session tools.
 
 Override the read store for an isolated or offline inspection by starting the daemon with
 `--codex-home PATH`. This changes the daemon, not `codexctl` itself.

@@ -27,7 +27,7 @@ pub use write_backend::{
     StartedTurnReceipt, ThreadWriterState, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 42;
+pub const PROTOCOL_VERSION: u32 = 43;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +142,10 @@ pub enum Request {
         thread_id: String,
         model: String,
         effort: String,
+    },
+    ThreadCwdUpdate {
+        thread_id: String,
+        cwd: PathBuf,
     },
     ThreadRename {
         thread_id: String,
@@ -302,6 +306,7 @@ impl Request {
             Self::TemporaryTurnStart { .. } => "temporary_turn_start",
             Self::TemporaryTurnInterrupt { .. } => "temporary_turn_interrupt",
             Self::ThreadSettingsUpdate { .. } => "thread_settings_update",
+            Self::ThreadCwdUpdate { .. } => "thread_cwd_update",
             Self::ThreadRename { .. } => "thread_rename",
             Self::ThreadArchive { .. } => "thread_archive",
             Self::ThreadRepairOrdinals { .. } => "thread_repair_ordinals",

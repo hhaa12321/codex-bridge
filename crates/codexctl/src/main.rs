@@ -18,7 +18,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
-    /// Target thread for show/send/steer/interrupt/host-exec, overriding daemon selection.
+    /// Target thread for show/send/steer/interrupt/host-exec/relocate, overriding daemon selection.
     #[arg(long, global = true, value_name = "THREAD_ID")]
     thread: Option<String>,
 
@@ -73,6 +73,16 @@ enum Command {
         /// Return only the last N user/assistant messages.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=10000))]
         last: Option<u32>,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a session's working directory after moving its project.
+    Relocate {
+        /// Existing absolute directory to use for subsequent turns.
+        #[arg(value_name = "DIRECTORY")]
+        directory: PathBuf,
 
         /// Emit structured JSON.
         #[arg(long)]
@@ -224,6 +234,14 @@ impl Command {
                 },
                 json,
                 OutputKind::Messages,
+            )),
+            Self::Relocate { directory, json } => Ok((
+                Request::ThreadCwdUpdate {
+                    thread_id: target_thread.context("relocate requires --thread THREAD_ID")?,
+                    cwd: directory,
+                },
+                json,
+                OutputKind::Generic,
             )),
             Self::Tail => {
                 reject_target(&target_thread, "tail")?;
@@ -649,6 +667,30 @@ mod tests {
                 last: Some(5),
             }
         );
+    }
+
+    #[test]
+    fn relocate_requires_explicit_thread_and_keeps_directory_path() {
+        let cli = Cli::try_parse_from([
+            "codexctl",
+            "--thread",
+            "thread-1",
+            "relocate",
+            "/tmp/new-project",
+            "--json",
+        ])
+        .unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::ThreadCwdUpdate {
+                thread_id: "thread-1".into(),
+                cwd: PathBuf::from("/tmp/new-project"),
+            }
+        );
+        let cli = Cli::try_parse_from(["codexctl", "relocate", "/tmp/new-project"]).unwrap();
+        assert!(cli.command.into_request(cli.thread).is_err());
     }
 
     #[test]

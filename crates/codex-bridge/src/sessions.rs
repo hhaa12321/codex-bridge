@@ -97,6 +97,7 @@ pub struct SessionStore {
     summary_cache: Arc<Mutex<Option<SummaryCache>>>,
     ephemeral_threads: Arc<Mutex<HashMap<String, ThreadSummary>>>,
     ephemeral_chat_threads: Arc<Mutex<HashSet<String>>>,
+    cwd_overrides: Arc<Mutex<HashMap<String, PathBuf>>>,
     message_cache: Arc<Mutex<HashMap<PathBuf, CachedMessages>>>,
     message_load_locks: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
     activity_cache: Arc<Mutex<HashMap<PathBuf, CachedActivity>>>,
@@ -369,6 +370,7 @@ const PINNED_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 pub struct ThreadProjectIndex {
     projects: HashMap<String, IndexedProject>,
     thread_projects: HashMap<String, Option<String>>,
+    thread_cwds: HashMap<String, PathBuf>,
     sections: Vec<(String, String)>,
     thread_sections: HashMap<String, String>,
     section_projects: HashMap<PathBuf, String>,
@@ -441,6 +443,16 @@ impl ThreadProjectIndex {
                 Some((id, project_id))
             })
             .collect();
+        let thread_cwds = threads
+            .iter()
+            .filter_map(|thread| {
+                let cwd = thread.get("cwd")?.as_str()?;
+                if !Path::new(cwd).is_absolute() {
+                    return None;
+                }
+                Some((thread.get("id")?.as_str()?.to_owned(), PathBuf::from(cwd)))
+            })
+            .collect();
         let sections = sections
             .get("data")
             .and_then(Value::as_array)
@@ -466,6 +478,7 @@ impl ThreadProjectIndex {
         Self {
             projects,
             thread_projects,
+            thread_cwds,
             sections,
             thread_sections,
             section_projects: HashMap::new(),
@@ -572,6 +585,10 @@ impl ThreadProjectIndex {
         Some(PathBuf::from(format!("{SECTION_PATH_PREFIX}{section_id}")))
     }
 
+    pub fn thread_cwds(&self) -> &HashMap<String, PathBuf> {
+        &self.thread_cwds
+    }
+
     fn group_for_thread(&self, thread: &ThreadSummary) -> (PathBuf, String, ProjectKind) {
         if let Some(section_id) = self.thread_sections.get(&thread.id) {
             if let Some((_, name)) = self.sections.iter().find(|(id, _)| id == section_id) {
@@ -587,10 +604,16 @@ impl ThreadProjectIndex {
                 .as_ref()
                 .and_then(|project_id| self.projects.get(project_id))
             {
-                let path = matching_project_root(project, &thread.cwd)
-                    .or_else(|| project.roots.first().cloned())
-                    .unwrap_or_else(|| thread.cwd.clone());
-                return (path, project.name.clone(), ProjectKind::Project);
+                let git_root = project_root_for_cwd(&thread.cwd);
+                let moved_to_git_project = git_root.join(".git").exists()
+                    && !project.roots.iter().any(|root| root == &git_root);
+                if let Some(path) = matching_project_root(project, &thread.cwd).or_else(|| {
+                    (!moved_to_git_project)
+                        .then(|| project.roots.first().cloned())
+                        .flatten()
+                }) {
+                    return (path, project.name.clone(), ProjectKind::Project);
+                }
             }
         }
         if let Some((project, path)) = self
@@ -604,6 +627,10 @@ impl ThreadProjectIndex {
             return (path, project.name.clone(), ProjectKind::Project);
         }
         if self.thread_projects.contains_key(&thread.id) {
+            let root = project_root_for_cwd(&thread.cwd);
+            if root.join(".git").exists() {
+                return (root.clone(), project_name(&root), ProjectKind::Project);
+            }
             return (
                 PathBuf::from(CHATS_PROJECT_PATH),
                 "Chats".to_owned(),
@@ -795,6 +822,7 @@ impl SessionStore {
             summary_cache: Arc::new(Mutex::new(None)),
             ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
             ephemeral_chat_threads: Arc::new(Mutex::new(HashSet::new())),
+            cwd_overrides: Arc::new(Mutex::new(HashMap::new())),
             message_cache: Arc::new(Mutex::new(HashMap::new())),
             message_load_locks: Arc::new(Mutex::new(HashMap::new())),
             activity_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -887,6 +915,37 @@ impl SessionStore {
         }
     }
 
+    pub fn set_thread_cwd(&self, thread_id: &str, cwd: PathBuf) {
+        if let Ok(mut overrides) = self.cwd_overrides.lock() {
+            overrides.insert(thread_id.to_owned(), cwd.clone());
+        }
+        if let Ok(mut threads) = self.ephemeral_threads.lock() {
+            if let Some(thread) = threads.get_mut(thread_id) {
+                thread.cwd = cwd;
+            }
+        }
+        if let Ok(mut chats) = self.ephemeral_chat_threads.lock() {
+            chats.remove(thread_id);
+        }
+    }
+
+    pub fn sync_thread_cwds(&self, index: &ThreadProjectIndex) {
+        if let Ok(mut overrides) = self.cwd_overrides.lock() {
+            overrides.extend(index.thread_cwds().clone());
+        }
+    }
+
+    fn apply_cwd_overrides(&self, threads: &mut [ThreadSummary]) {
+        if let Ok(overrides) = self.cwd_overrides.lock() {
+            for thread in threads {
+                if let Some(cwd) = overrides.get(&thread.id) {
+                    thread.cwd = cwd.clone();
+                    thread.git_branch = None;
+                }
+            }
+        }
+    }
+
     pub fn remove_ephemeral_thread(&self, thread_id: &str) {
         if let Ok(mut threads) = self.ephemeral_threads.lock() {
             threads.remove(thread_id);
@@ -920,9 +979,8 @@ impl SessionStore {
 
     pub fn find_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
         // An exact lookup should not turn an expired list-cache TTL into a full
-        // rollout rescan. Thread identity and cwd are immutable rollout
-        // metadata, so a stale list entry is still suitable for detail and file
-        // authorization requests. Newly started threads are covered by the
+        // rollout rescan. Thread identity and rollout path are immutable here;
+        // app-server cwd changes are overlaid below. Newly started threads are covered by the
         // ephemeral index. On a genuine miss, inspect only rollout filenames
         // matching this id instead of parsing every thread to rebuild the list.
         let mut thread = self.summary_cache.lock().ok().and_then(|cache| {
@@ -953,6 +1011,7 @@ impl SessionStore {
                 .find(|thread| thread.id == thread_id);
         }
         if let Some(thread) = &mut thread {
+            self.apply_cwd_overrides(std::slice::from_mut(thread));
             populate_git_branches(std::slice::from_mut(thread), &self.git_branch_cache);
         }
         Ok(thread)
@@ -1186,10 +1245,12 @@ impl SessionStore {
         if let Ok(cache) = self.summary_cache.lock() {
             if let Some(cache) = cache.as_ref() {
                 if cache.refreshed_at.elapsed() <= SUMMARY_CACHE_TTL {
-                    return Ok(self.merge_ephemeral_threads(filter_archived(
+                    let mut threads = self.merge_ephemeral_threads(filter_archived(
                         cache.threads.clone(),
                         include_archived,
-                    )));
+                    ));
+                    self.apply_cwd_overrides(&mut threads);
+                    return Ok(threads);
                 }
             }
         }
@@ -1201,7 +1262,9 @@ impl SessionStore {
                 threads: threads.clone(),
             });
         }
-        Ok(self.merge_ephemeral_threads(filter_archived(threads, include_archived)))
+        let mut threads = self.merge_ephemeral_threads(filter_archived(threads, include_archived));
+        self.apply_cwd_overrides(&mut threads);
+        Ok(threads)
     }
 
     fn merge_ephemeral_threads(&self, mut threads: Vec<ThreadSummary>) -> Vec<ThreadSummary> {
@@ -3840,6 +3903,38 @@ mod tests {
             .unwrap();
         assert_eq!(available, 1);
         assert_eq!(threads[0].id, "moved-thread");
+    }
+
+    #[test]
+    fn app_server_cwd_moves_chat_into_new_git_project_without_rewriting_rollout() {
+        let fixture = Fixture::new();
+        let chat = fixture.path.join("chat");
+        let project = fixture.path.join("projects/new-project");
+        fs::create_dir_all(&chat).unwrap();
+        init_git_repo(&project, "main");
+        let record = format!(
+            r#"{{"timestamp":"2026-09-09T01:00:00Z","type":"session_meta","payload":{{"id":"relocated-thread","cwd":{}}}}}"#,
+            serde_json::to_string(&chat).unwrap()
+        );
+        let rollout = fixture.write_rollout("rollout-relocated.jsonl", &[&record]);
+        let index = ThreadProjectIndex::from_app_server(
+            &json!({"data":[]}),
+            &[json!({"id":"relocated-thread","cwd":project,"projectId":null})],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        store.sync_thread_cwds(&index);
+        let summary = store.find_thread("relocated-thread").unwrap().unwrap();
+        assert_eq!(summary.cwd, project);
+        let projects = store.list_projects_with_index(false, Some(&index)).unwrap();
+        assert_eq!(
+            projects
+                .iter()
+                .find(|entry| entry.path == project)
+                .unwrap()
+                .thread_count,
+            1
+        );
+        assert_eq!(fs::read_to_string(rollout).unwrap().trim(), record);
     }
 
     #[test]

@@ -5512,6 +5512,32 @@ fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
     })
 }
 
+fn relocated_workspace_roots(thread: &Value, old_cwd: &Path, target: &Path) -> Vec<PathBuf> {
+    let mut roots = thread
+        .get("environments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|environment| environment.get("cwd").and_then(Value::as_str) == old_cwd.to_str())
+        .flat_map(|environment| {
+            environment
+                .get("runtimeWorkspaceRoots")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute() && root != old_cwd)
+        .collect::<Vec<_>>();
+    if !roots.iter().any(|root| target.starts_with(root)) {
+        roots.push(target.to_path_buf());
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn pinned_thread_ids(write_backend: &CodexCliBackend) -> Result<Vec<String>, BackendFailure> {
     let mut ids = Vec::new();
     let mut cursor = None::<String>;
@@ -6394,16 +6420,19 @@ fn app_server_project_index(
     cache: &AppServerProjectCache,
     include_archived: bool,
     codex_home: &Path,
+    session_store: &SessionStore,
 ) -> Option<ThreadProjectIndex> {
     if let Ok(cached) = cache.index.read() {
         if let Some(cached) = cached.as_ref().filter(|cached| {
             cached.refreshed_at.elapsed() <= PROJECT_INDEX_TTL
                 && (cached.includes_archived || !include_archived)
         }) {
+            session_store.sync_thread_cwds(&cached.index);
             return Some(cached.index.clone());
         }
     }
     let index = fetch_app_server_project_index(write_backend, include_archived, codex_home).ok()?;
+    session_store.sync_thread_cwds(&index);
     if let Ok(mut cached) = cache.index.write() {
         *cached = Some(CachedAppServerProjectIndex {
             refreshed_at: Instant::now(),
@@ -6423,6 +6452,18 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
     let pending_messages = state.pending_messages.as_ref();
     let app_server_tools = state.app_server_tools.as_ref();
     let app_server_projects = state.app_server_projects.as_ref();
+    if matches!(
+        &request,
+        Request::Ls { .. } | Request::Current | Request::Show { .. } | Request::Messages { .. }
+    ) {
+        let _ = app_server_project_index(
+            write_backend,
+            app_server_projects,
+            false,
+            session_store.home(),
+            session_store,
+        );
+    }
     match request {
         Request::Status => {
             if write_backend.app_server_socket().is_some() {
@@ -6751,6 +6792,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 app_server_projects,
                 include_archived,
                 session_store.home(),
+                session_store,
             );
             match session_store.list_projects_with_index(include_archived, project_index.as_ref()) {
                 Ok(projects) => Response::success(json!({
@@ -6789,6 +6831,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 app_server_projects,
                 include_archived,
                 session_store.home(),
+                session_store,
             );
             match session_store.list_project_threads_with_index(
                 &project_path,
@@ -7854,6 +7897,126 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => write_backend_error(error),
             }
         }
+        Request::ThreadCwdUpdate { thread_id, cwd } => {
+            if matches!(
+                write_backend.thread_writer_state(&thread_id),
+                ThreadWriterState::External | ThreadWriterState::Released
+            ) {
+                return Response::error(
+                    "thread_writer_not_owned",
+                    "another app-server owns this session, or its writer was released",
+                );
+            }
+            let active_turn = match session_store.active_turn_id(&thread_id) {
+                Ok(active_turn) => active_turn,
+                Err(error) => return backend_error(error),
+            };
+            if active_turn.is_some() {
+                return Response::error(
+                    "thread_busy",
+                    "wait for the current turn to finish before changing the session directory",
+                );
+            }
+            let target = match prepare_thread_cwd(&cwd, false, session_store.home()) {
+                Ok(prepared) => prepared.cwd,
+                Err(error) => return Response::error(error.code, error.message),
+            };
+            let before = match write_backend.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            ) {
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
+            let Some(old_cwd) = before.pointer("/thread/cwd").and_then(Value::as_str) else {
+                return Response::error("app_server_protocol_error", "thread/read returned no cwd");
+            };
+            let workspace_roots =
+                relocated_workspace_roots(&before["thread"], Path::new(old_cwd), &target);
+            if before
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+                == Some("notLoaded")
+            {
+                if let Err(error) = write_backend.app_server_rpc(
+                    "thread/resume",
+                    json!({
+                        "threadId": thread_id,
+                        "cwd": target,
+                        "runtimeWorkspaceRoots": workspace_roots,
+                        "excludeTurns": true,
+                    }),
+                ) {
+                    return write_backend_error(error);
+                }
+            }
+            if let Err(error) = write_backend.app_server_rpc(
+                "thread/settings/update",
+                json!({"threadId": thread_id, "cwd": target}),
+            ) {
+                return write_backend_error(error);
+            }
+            let after = match write_backend.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            ) {
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
+            if after.pointer("/thread/cwd").and_then(Value::as_str) != target.to_str() {
+                return Response::error(
+                    "app_server_protocol_error",
+                    "thread/settings/update did not persist the requested directory",
+                );
+            }
+            let workspace_roots_applied = after
+                .pointer("/thread/environments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|environment| {
+                    environment.get("cwd").and_then(Value::as_str) == target.to_str()
+                })
+                .flat_map(|environment| {
+                    environment
+                        .get("runtimeWorkspaceRoots")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter_map(Value::as_str)
+                .any(|root| target.starts_with(root));
+            let project_id = app_server_list_all(
+                write_backend,
+                "project/list",
+                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+            )
+            .ok()
+            .and_then(|projects| project_id_for_path(&json!({"data": projects}), &target));
+            let project_assigned = if let Some(project_id) = &project_id {
+                write_backend
+                    .app_server_rpc(
+                        "thread/metadata/update",
+                        json!({"threadId": thread_id, "projectId": project_id}),
+                    )
+                    .is_ok()
+            } else {
+                false
+            };
+            if let Ok(mut cached) = app_server_projects.index.write() {
+                *cached = None;
+            }
+            session_store.set_thread_cwd(&thread_id, target.clone());
+            let _ = write_backend.watch_thread(&thread_id);
+            Response::success(json!({
+                "action": "thread_cwd_update",
+                "thread_id": thread_id,
+                "old_cwd": old_cwd,
+                "cwd": target,
+                "project_assigned": project_assigned,
+                "workspace_roots_applied": workspace_roots_applied,
+            }))
+        }
         Request::ThreadRename { thread_id, name } => {
             let name = name.trim();
             if name.is_empty() || name.chars().count() > 200 {
@@ -7983,6 +8146,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     app_server_projects,
                     false,
                     session_store.home(),
+                    session_store,
                 );
                 let mut threads = Vec::new();
                 for thread_id in &thread_ids {
@@ -9756,6 +9920,25 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn relocated_workspace_roots_replace_old_root_and_keep_other_directories() {
+        let thread = json!({"environments":[{
+            "cwd":"/tmp/chat",
+            "runtimeWorkspaceRoots":["/tmp/chat","/tmp/shared"]
+        }]});
+        assert_eq!(
+            relocated_workspace_roots(
+                &thread,
+                Path::new("/tmp/chat"),
+                Path::new("/tmp/projects/new-project"),
+            ),
+            [
+                PathBuf::from("/tmp/projects/new-project"),
+                PathBuf::from("/tmp/shared")
+            ]
+        );
+    }
 
     #[test]
     fn temporary_fork_uses_the_last_completed_turn_when_selection_is_in_progress() {

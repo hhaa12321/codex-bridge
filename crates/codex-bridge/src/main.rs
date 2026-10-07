@@ -67,6 +67,8 @@ const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
 const WEB_FILE_PREVIEW_JS: &str = include_str!("../../../web-ui/dist/assets/file-preview.js");
+const WEB_APP_ICON: &[u8] = include_bytes!("../../../web-ui/dist/app-icon.png");
+const WEB_FAVICON: &[u8] = include_bytes!("../../../web-ui/dist/favicon.ico");
 const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
 const MAX_PERFORMANCE_EVENTS: usize = 128;
@@ -3659,6 +3661,9 @@ fn web_router(state: WebState) -> Router {
         .route("/assets/app.js", get(web_app_js))
         .route("/assets/app.css", get(web_app_css))
         .route("/assets/file-preview.js", get(web_file_preview_js))
+        .route("/app-icon.png", get(web_app_icon))
+        .route("/apple-touch-icon.png", get(web_app_icon))
+        .route("/favicon.ico", get(web_favicon))
         .route("/api/auth", get(web_auth_check))
         .route("/api/file-ticket", post(web_file_ticket))
         .route("/api/file", get(web_file_download))
@@ -3729,6 +3734,34 @@ async fn web_file_preview_js(State(state): State<WebState>, headers: HeaderMap) 
         WEB_FILE_PREVIEW_JS,
         "text/javascript; charset=utf-8",
         "private, no-cache",
+    )
+}
+
+async fn web_app_icon(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        Bytes::from_static(WEB_APP_ICON),
+        "image/png",
+        web_asset_cache_control(query.as_deref()),
+    )
+}
+
+async fn web_favicon(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        Bytes::from_static(WEB_FAVICON),
+        "image/x-icon",
+        web_asset_cache_control(query.as_deref()),
     )
 }
 

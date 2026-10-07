@@ -654,6 +654,14 @@ aside {
 .brand-link:hover {
   color: var(--accent2);
 }
+.brand-icon {
+  display: block;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  margin-right: 8px;
+  border-radius: 7px;
+}
 .settings-toggle {
   display: inline-grid;
   flex: 0 0 auto;
@@ -675,14 +683,6 @@ aside {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
   background: var(--active-thread);
   color: var(--accent2);
-}
-.dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  margin-right: 8px;
 }
 .sub,
 .meta,

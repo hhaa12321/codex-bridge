@@ -77,6 +77,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": "http://127.0.0.1:18791",
+      "/login": "http://127.0.0.1:18791",
     },
   },
   build: {

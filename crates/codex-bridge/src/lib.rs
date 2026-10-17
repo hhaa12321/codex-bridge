@@ -19,8 +19,8 @@ pub use host_executor::{
 pub use sessions::{
     default_codex_home, MessagePage, MessageReadProfile, ProjectKind, ProjectSummary,
     ProjectThreadSummary, RolloutOrdinalRepair, SessionStore, ThreadActivity, ThreadMessage,
-    ThreadProjectIndex, ThreadSnapshot, ThreadSummary, ThreadToolCall, CHATS_PROJECT_PATH,
-    CODEX_HOME_ENV,
+    ThreadProjectIndex, ThreadSnapshot, ThreadSummary, ThreadToolCall, TokenUsageWindows,
+    CHATS_PROJECT_PATH, CODEX_HOME_ENV,
 };
 pub use write_backend::{
     AppServerRuntimeInfo, BackendFailure, BackendSuccess, CodexCliBackend, NativeQueueReceipt,
@@ -33,12 +33,17 @@ pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
+    TokenUsageWindows,
     Ls {
         limit: u32,
         include_archived: bool,
     },
     Projects {
         include_archived: bool,
+    },
+    ProjectCreate {
+        path: PathBuf,
+        name: Option<String>,
     },
     ProjectThreads {
         project_path: PathBuf,
@@ -122,6 +127,18 @@ pub enum Request {
     ThreadCreateStatus {
         job_id: String,
     },
+    ThreadFork {
+        thread_id: String,
+        last_turn_id: String,
+        worktree: bool,
+    },
+    ThreadForkStart {
+        thread_id: String,
+        last_turn_id: String,
+    },
+    ThreadForkStatus {
+        job_id: String,
+    },
     TemporaryThreadCreate {
         thread_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +200,15 @@ pub enum Request {
         submission_id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<ComposerAttachment>,
+    },
+    InterruptedTurnEdit {
+        thread_id: String,
+    },
+    InterruptedTurnRetry {
+        thread_id: String,
+        turn_id: String,
+        text: String,
+        submission_id: String,
     },
     Steer {
         thread_id: Option<String>,
@@ -267,6 +293,10 @@ pub enum ComposerAttachment {
         id: String,
         text: String,
     },
+    File {
+        id: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -280,8 +310,10 @@ pub struct RealtimeAudioChunk {
 impl Request {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::TokenUsageWindows => "token_usage_windows",
             Self::Ls { .. } => "ls",
             Self::Projects { .. } => "projects",
+            Self::ProjectCreate { .. } => "project_create",
             Self::ProjectThreads { .. } => "project_threads",
             Self::Messages { .. } => "messages",
             Self::SubagentMessages { .. } => "subagent_messages",
@@ -302,6 +334,9 @@ impl Request {
             Self::ThreadCreate { .. } => "thread_create",
             Self::ThreadCreateStart { .. } => "thread_create_start",
             Self::ThreadCreateStatus { .. } => "thread_create_status",
+            Self::ThreadFork { .. } => "thread_fork",
+            Self::ThreadForkStart { .. } => "thread_fork_start",
+            Self::ThreadForkStatus { .. } => "thread_fork_status",
             Self::TemporaryThreadCreate { .. } => "temporary_thread_create",
             Self::TemporaryTurnStart { .. } => "temporary_turn_start",
             Self::TemporaryTurnInterrupt { .. } => "temporary_turn_interrupt",
@@ -320,6 +355,8 @@ impl Request {
             Self::Show { .. } => "show",
             Self::Tail => "tail",
             Self::Send { .. } => "send",
+            Self::InterruptedTurnEdit { .. } => "interrupted_turn_edit",
+            Self::InterruptedTurnRetry { .. } => "interrupted_turn_retry",
             Self::Steer { .. } => "steer",
             Self::AsyncQuestions { .. } => "async_questions",
             Self::AsyncQuestionReply { .. } => "async_question_reply",
@@ -615,6 +652,31 @@ mod tests {
         })
         .unwrap();
         assert_eq!(create_status["command"], "thread_create_status");
+
+        let fork = serde_json::to_value(Request::ThreadFork {
+            thread_id: "thread-1".into(),
+            last_turn_id: "turn-7".into(),
+            worktree: false,
+        })
+        .unwrap();
+        assert_eq!(fork["command"], "thread_fork");
+        assert_eq!(fork["last_turn_id"], "turn-7");
+        assert_eq!(fork["worktree"], false);
+        assert_eq!(
+            serde_json::to_value(Request::ThreadForkStart {
+                thread_id: "thread-1".into(),
+                last_turn_id: "turn-7".into(),
+            })
+            .unwrap()["command"],
+            "thread_fork_start"
+        );
+        assert_eq!(
+            serde_json::to_value(Request::ThreadForkStatus {
+                job_id: "job-1".into(),
+            })
+            .unwrap()["command"],
+            "thread_fork_status"
+        );
 
         let temporary = serde_json::to_value(Request::TemporaryThreadCreate {
             thread_id: "thread-1".into(),

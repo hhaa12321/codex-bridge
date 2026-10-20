@@ -36,14 +36,12 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.12 · 2026-10-20
+### v0.3.13 · 2026-10-20
 
-- **Sessions:** switch to the 50 most recently active sessions; Queue messages reliably start after an active run ends.
-- **Activity:** summarize a tool group on demand and monitor Bridge response sizes in Settings.
-- **Account and usage:** sign in with a passkey, view weekly limit history, and inspect token usage by model.
-- **Desktop:** detect Desktop-owned app-server instances when showing session writer status.
+- **Settings:** a separate, responsive panel makes account, usage, appearance, and connection controls easier to browse without losing your place in a conversation.
+- **Passkeys:** names stay readable and the Remove button remains on one line, including on narrow screens.
 
-See the [latest release notes](docs/releases/v0.3.12.md) or the
+See the [latest release notes](docs/releases/v0.3.13.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI

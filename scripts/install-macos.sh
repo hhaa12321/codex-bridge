@@ -35,7 +35,10 @@ config_path=$config_dir/config.toml
 runtime_dir=$HOME/.codex-bridge
 state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/codex-bridge
 launcher_dir=$HOME/Library/LaunchAgents
-desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex
+desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
+if [ ! -x "$desktop_codex" ]; then
+  desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex
+fi
 desktop_main=/Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 adapter_port=18790
 domain=gui/$(id -u)

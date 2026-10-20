@@ -64,13 +64,30 @@ export function pendingInputSummary(text, attachments) {
 
 export function mergePendingSnapshot(remote, local, inFlightIds) {
   const entries = Array.isArray(remote) ? remote : [],
+    localById = new Map(local.map((entry) => [entry.id, entry])),
     ids = new Set(entries.map((entry) => entry.id));
   return [
-    ...entries,
-    ...local.filter(
-      (entry) =>
-        entry.source === "web_optimistic" && inFlightIds.has(entry.id) && !ids.has(entry.id),
-    ),
+    ...entries.map((entry) => {
+      const previous = localById.get(entry.id);
+      return {
+        ...entry,
+        ...(previous?.local_submission ? { local_submission: true } : {}),
+        ...(previous?.status === "accepted" && ["queueing", "steering"].includes(entry.status)
+          ? { status: "accepted" }
+          : {}),
+      };
+    }),
+    ...local
+      .filter(
+        (entry) =>
+          !ids.has(entry.id) &&
+          (inFlightIds.has(entry.id) || (entry.local_submission && entry.status !== "failed")),
+      )
+      .map((entry) =>
+        entry.local_submission && entry.status === "queued" && !inFlightIds.has(entry.id)
+          ? { ...entry, status: "accepted" }
+          : entry,
+      ),
   ];
 }
 

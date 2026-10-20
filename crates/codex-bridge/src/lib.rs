@@ -27,13 +27,14 @@ pub use write_backend::{
     StartedTurnReceipt, ThreadWriterState, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 43;
+pub const PROTOCOL_VERSION: u32 = 44;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
     TokenUsageWindows,
+    WeeklyUsageHistory,
     Ls {
         limit: u32,
         include_archived: bool,
@@ -78,6 +79,10 @@ pub enum Request {
         thread_id: String,
         message_index: u32,
         tool_index: u32,
+    },
+    ToolGroupSummarize {
+        thread_id: String,
+        message_index: u32,
     },
     ThreadActivity {
         thread_id: String,
@@ -198,6 +203,8 @@ pub enum Request {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         submission_id: Option<String>,
+        #[serde(default)]
+        ensure_delivery: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<ComposerAttachment>,
     },
@@ -311,6 +318,7 @@ impl Request {
     pub fn name(&self) -> &'static str {
         match self {
             Self::TokenUsageWindows => "token_usage_windows",
+            Self::WeeklyUsageHistory => "weekly_usage_history",
             Self::Ls { .. } => "ls",
             Self::Projects { .. } => "projects",
             Self::ProjectCreate { .. } => "project_create",
@@ -321,6 +329,7 @@ impl Request {
             Self::TurnMessages { .. } => "turn_messages",
             Self::MessageContent { .. } => "message_content",
             Self::ToolContent { .. } => "tool_content",
+            Self::ToolGroupSummarize { .. } => "tool_group_summarize",
             Self::ThreadActivity { .. } => "thread_activity",
             Self::ThreadWatch { .. } => "thread_watch",
             Self::ThreadWriterRelease { .. } => "thread_writer_release",
@@ -745,6 +754,7 @@ mod tests {
             thread_id: Some("thread-1".into()),
             text: "continue".into(),
             submission_id: Some("web-1".into()),
+            ensure_delivery: false,
             attachments: Vec::new(),
         };
 

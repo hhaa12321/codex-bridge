@@ -27,6 +27,7 @@ import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18
 import { MAX_PASTED_TEXT_BYTES, shouldAttachPastedText } from "./large-paste.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
+import { mergeModelUsage, modelUsageRows } from "./model-usage.js";
 import {
   shouldCollapseAssistantOutput,
   shouldCollapseUserMessage,
@@ -52,6 +53,7 @@ import {
 } from "./composer-state.js";
 import {
   persistExpandedProjects,
+  recentSidebarThreads,
   sidebarProjectGroups,
   storedExpandedProjects,
 } from "./project-state.js";
@@ -59,6 +61,9 @@ import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
 import { toolOutputImageUrls } from "./tool-image.js";
 import { orderedTurnChildren, turnUsageHost } from "./turn-stack.js";
+import { trafficMonitor } from "./traffic-monitor.js";
+import { weeklyUsageBuckets } from "./weekly-usage-chart.js";
+import { initPasskeySettings } from "./passkey-settings.js";
 import {
   rememberSessionId,
   sessionHash,
@@ -132,6 +137,70 @@ function formatResourceBytes(value) {
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / 1024 ** 2).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0)} MiB`;
 }
+
+function renderTrafficMonitor() {
+  const { enabled, totals, recent } = trafficMonitor.snapshot();
+  const root = $("trafficMonitorResults");
+  const recentOpen = Boolean(root.querySelector("details")?.open);
+  $("trafficMonitorToggle").checked = enabled;
+  $("trafficMonitorClear").hidden = !enabled;
+  root.hidden = !enabled;
+  if (!enabled || $("settingsPanel").hidden) return;
+  root.replaceChildren();
+  const totalBytes = totals.reduce((sum, item) => sum + item.bytes, 0);
+  const totalCount = totals.reduce((sum, item) => sum + item.count, 0);
+  const heading = document.createElement("strong");
+  heading.textContent = tr("trafficMonitorTotal", {
+    bytes: formatResourceBytes(totalBytes),
+    count: totalCount,
+  });
+  root.appendChild(heading);
+  if (!recent.length) {
+    const empty = document.createElement("div");
+    empty.className = "settings-help";
+    empty.textContent = tr("trafficMonitorEmpty");
+    root.appendChild(empty);
+    return;
+  }
+  const totalsList = document.createElement("div");
+  totalsList.className = "traffic-monitor-totals";
+  for (const item of totals) {
+    const row = document.createElement("div");
+    const label = document.createElement("span");
+    const value = document.createElement("span");
+    label.textContent = `${item.name} · ${item.count}`;
+    value.textContent = formatResourceBytes(item.bytes);
+    row.append(label, value);
+    totalsList.appendChild(row);
+  }
+  root.appendChild(totalsList);
+  const details = document.createElement("details");
+  details.className = "traffic-monitor-recent";
+  details.open = recentOpen;
+  const summary = document.createElement("summary");
+  summary.textContent = tr("trafficMonitorRecent");
+  details.appendChild(summary);
+  for (const item of recent) {
+    const row = document.createElement("div");
+    const label = document.createElement("span");
+    const value = document.createElement("span");
+    label.textContent = `${new Date(item.time).toLocaleTimeString()} · ${item.name}`;
+    value.textContent = formatResourceBytes(item.bytes);
+    row.title = String(item.status);
+    row.append(label, value);
+    details.appendChild(row);
+  }
+  root.appendChild(details);
+}
+let trafficMonitorRenderTimer = null;
+trafficMonitor.subscribe(() => {
+  if ($("settingsPanel").hidden) return;
+  if (trafficMonitorRenderTimer !== null) return;
+  trafficMonitorRenderTimer = window.setTimeout(() => {
+    trafficMonitorRenderTimer = null;
+    renderTrafficMonitor();
+  }, 250);
+});
 
 function renderRuntimeResources() {
   const root = $("resourceStatus"),
@@ -450,6 +519,118 @@ async function loadStatus() {
 }
 let usageWindows = null;
 let usageWindowsLoading = false;
+let weeklyHistory = null;
+let weeklyHistoryLoading = false;
+let weeklyHistoryScale = "day";
+function renderWeeklyHistory() {
+  const root = $("weeklyHistoryChart");
+  root.replaceChildren();
+  for (const [scale, id] of [
+    ["day", "weeklyHistoryDay"],
+    ["hour", "weeklyHistoryHour"],
+  ]) {
+    $(id).classList.toggle("active", weeklyHistoryScale === scale);
+    $(id).setAttribute("aria-pressed", String(weeklyHistoryScale === scale));
+  }
+  const samples = weeklyHistory?.samples || [];
+  const latest = samples.findLast((sample) => Number.isFinite(sample.remaining_percent));
+  $("weeklyHistorySummary").textContent = latest
+    ? tr("weeklyHistoryCurrent", {
+        percent: latest.remaining_percent,
+        time: new Date(latest.observed_at * 1000).toLocaleString(),
+      })
+    : tr("weeklyHistoryEmpty");
+  if (!samples.length) {
+    root.textContent = tr("weeklyHistoryEmpty");
+    return;
+  }
+  const buckets = weeklyUsageBuckets(samples, weeklyHistoryScale);
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 320 154");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", tr("weeklyRemainingHistory"));
+  const add = (name, attributes, parent = svg) => {
+    const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+    for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+    parent.append(node);
+    return node;
+  };
+  for (const percent of [100, 50, 0]) {
+    const y = 8 + (100 - percent) * 1.16;
+    add("line", { x1: 27, x2: 312, y1: y, y2: y, class: "weekly-history-grid" });
+    add("text", { x: 0, y: y + 3, class: "weekly-history-label" }).textContent = `${percent}`;
+  }
+  let path = "";
+  let lineOpen = false;
+  buckets.forEach((bucket, index) => {
+    const value = bucket.sample?.remaining_percent;
+    if (!Number.isFinite(value)) {
+      lineOpen = false;
+      return;
+    }
+    const x = 27 + (index / (buckets.length - 1)) * 285;
+    const y = 8 + (100 - Math.max(0, Math.min(100, value))) * 1.16;
+    path += `${lineOpen ? " L" : " M"}${x.toFixed(2)} ${y.toFixed(2)}`;
+    lineOpen = true;
+  });
+  add("path", { d: path.trim(), class: "weekly-history-line" });
+  buckets.forEach((bucket, index) => {
+    const value = bucket.sample?.remaining_percent;
+    const x = 27 + (index / (buckets.length - 1)) * 285;
+    if (!Number.isFinite(value)) {
+      if (bucket.sample?.error_code) {
+        const failed = add("circle", { cx: x, cy: 124, r: 2, class: "weekly-history-failed" });
+        add("title", {}, failed).textContent = tr("weeklyHistoryFailedPoint", {
+          time: new Date(bucket.sample.observed_at * 1000).toLocaleString(),
+        });
+      }
+      return;
+    }
+    const y = 8 + (100 - Math.max(0, Math.min(100, value))) * 1.16;
+    const circle = add("circle", {
+      cx: x,
+      cy: y,
+      r: weeklyHistoryScale === "day" ? 3.5 : 2,
+      class: "weekly-history-point",
+    });
+    add("title", {}, circle).textContent = tr("weeklyHistoryPoint", {
+      time: new Date(bucket.sample.observed_at * 1000).toLocaleString(),
+      percent: value,
+    });
+  });
+  const formatTime = (time) =>
+    new Date(time).toLocaleString(
+      getLanguage() === "zh" ? "zh-CN" : "en-US",
+      weeklyHistoryScale === "day"
+        ? { month: "numeric", day: "numeric" }
+        : { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" },
+    );
+  add("text", { x: 27, y: 150, class: "weekly-history-label" }).textContent = formatTime(
+    buckets[0].time,
+  );
+  add("text", { x: 312, y: 150, "text-anchor": "end", class: "weekly-history-label" }).textContent =
+    formatTime(buckets.at(-1).time);
+  root.append(svg);
+}
+async function refreshWeeklyHistory() {
+  if (weeklyHistoryLoading || document.hidden || $("settingsPanel").hidden) return;
+  weeklyHistoryLoading = true;
+  try {
+    weeklyHistory = await command(
+      {
+        command: "weekly_usage_history",
+        now_seconds: Math.floor(Date.now() / 1000),
+      },
+      false,
+    );
+    renderWeeklyHistory();
+  } catch (error) {
+    if (!weeklyHistory) $("weeklyHistoryChart").textContent = tr("weeklyHistoryUnavailable");
+    $("weeklyHistoryChart").title = error.message;
+  } finally {
+    weeklyHistoryLoading = false;
+  }
+}
 function renderUsageWindows() {
   const root = $("usageWindows");
   root.replaceChildren();
@@ -482,7 +663,7 @@ function renderUsageWindows() {
   }
 }
 async function refreshUsageWindows() {
-  if (usageWindowsLoading || $("settingsPanel").hidden) return;
+  if (usageWindowsLoading || document.hidden || $("settingsPanel").hidden) return;
   usageWindowsLoading = true;
   try {
     usageWindows = await command({ command: "token_usage_windows" }, false);
@@ -592,6 +773,7 @@ function mergeThreadStatistics(statistics) {
   ]) {
     merged[key] = Math.max(Number(statistics[key] || 0), Number(state.threadStatistics[key] || 0));
   }
+  merged.model_usage = mergeModelUsage(statistics.model_usage, state.threadStatistics.model_usage);
   return merged;
 }
 function renderThreadStatistics(statistics = state.threadStatistics) {
@@ -625,6 +807,7 @@ function renderThreadStatistics(statistics = state.threadStatistics) {
   ];
   if (state.modelContextWindow)
     values.push([tr("modelContextWindow"), Number(state.modelContextWindow).toLocaleString()]);
+  const modelRows = modelUsageRows(statistics);
   for (const [label, value] of values) {
     const item = document.createElement("div"),
       name = document.createElement("span"),
@@ -632,6 +815,30 @@ function renderThreadStatistics(statistics = state.threadStatistics) {
     name.textContent = label;
     amount.textContent = value;
     item.append(name, amount);
+    if (label === tr("sessionTokens") && modelRows.length) {
+      item.classList.add("thread-stat-tokens");
+      const breakdown = document.createElement("div");
+      breakdown.className = "thread-stat-models";
+      for (const row of modelRows) {
+        const line = document.createElement("div");
+        line.className = "thread-stat-model";
+        const model = document.createElement("span");
+        model.textContent = row.model === "unknown" ? tr("sessionUnknownModel") : row.model;
+        const total = document.createElement("strong");
+        total.textContent = Number(row.total_tokens || 0).toLocaleString();
+        const details = document.createElement("small");
+        details.textContent = [
+          `${tr("sessionInputTokens")} ${Number(row.input_tokens || 0).toLocaleString()}`,
+          `${tr("sessionOutputTokens")} ${Number(row.output_tokens || 0).toLocaleString()}`,
+          `${tr("sessionCachedTokens")} ${Number(row.cached_input_tokens || 0).toLocaleString()}`,
+        ].join(" · ");
+        line.append(model, total);
+        if (Number(row.input_tokens || 0) + Number(row.output_tokens || 0) > 0)
+          line.append(details);
+        breakdown.append(line);
+      }
+      item.append(breakdown);
+    }
     grid.appendChild(item);
   }
 }
@@ -874,6 +1081,7 @@ async function toggleLanguage() {
   syncVoiceCapability();
   renderManagedServices();
   renderUsageWindows();
+  renderWeeklyHistory();
   renderAsyncQuestion();
   renderTasksButton();
   renderTaskOverviews();
@@ -904,6 +1112,8 @@ async function loadProjects({ restoreSession = true } = {}) {
   }
   if (removedStalePath && state.expandedPreferenceSaved) rememberExpandedProjects();
   renderProjects();
+  if (state.sessionView === "recent")
+    void loadRecentThreads().catch((error) => notify(error.message));
   void loadPins().then(() => renderProjects());
   if (!state.current && restoreSession) {
     const hashedId = sessionIdFromHash(window.location.hash),
@@ -923,6 +1133,31 @@ async function loadProjects({ restoreSession = true } = {}) {
     await openDefaultProjectThread();
   }
   preloadExpandedProjectThreads();
+}
+async function loadRecentThreads() {
+  const generation = ++state.recentLoadGeneration;
+  const includeArchived = $("archived").checked;
+  state.recentThreadsLoading = true;
+  renderProjects();
+  try {
+    const response = await command(
+      { command: "ls", limit: 50, include_archived: includeArchived },
+      false,
+    );
+    if (generation !== state.recentLoadGeneration || includeArchived !== $("archived").checked)
+      return;
+    state.recentThreads = (response.threads || []).slice(0, 50);
+  } finally {
+    if (generation === state.recentLoadGeneration) {
+      state.recentThreadsLoading = false;
+      renderProjects();
+    }
+  }
+}
+function toggleSessionView() {
+  state.sessionView = state.sessionView === "projects" ? "recent" : "projects";
+  renderProjects();
+  if (state.sessionView === "recent") run(loadRecentThreads);
 }
 async function loadInitialView() {
   const hashedId = sessionIdFromHash(window.location.hash),
@@ -946,12 +1181,6 @@ async function loadInitialView() {
   preloadExpandedProjectThreads();
 }
 async function loadPins() {
-  if (!state.directAppServer) {
-    state.pinAvailable = false;
-    state.pinnedIds.clear();
-    state.pinnedThreads = [];
-    return;
-  }
   try {
     const result = await command({ command: "thread_pins" }, false),
       ids = Array.isArray(result.thread_ids) ? result.thread_ids : [];
@@ -1383,7 +1612,7 @@ function taskCardNode(threadId, overview, runState, replyExpanded = false) {
 }
 function renderTaskOverviews() {
   const root = $("tasksList");
-  if (!root) return;
+  if (!root || !state.tasksOpen) return;
   const existing = new Map(
       [...root.querySelectorAll(":scope > .task-entry")].map((card) => [
         card.dataset.threadId,
@@ -1422,15 +1651,36 @@ function renderTaskOverviews() {
   root.replaceChildren(fragment);
 }
 let tasksRefreshTimer = null;
+let tasksFallbackTimer = null;
+let lastTaskOverviewRefresh = 0;
 function scheduleTasksRefresh(delay = 180) {
-  if (!state.tasksOpen || tasksRefreshTimer) return;
+  if (!state.tasksOpen || document.hidden || tasksRefreshTimer) return;
+  const wait = Math.max(delay, 2500 - (Date.now() - lastTaskOverviewRefresh));
   tasksRefreshTimer = setTimeout(() => {
     tasksRefreshTimer = null;
     refreshTaskOverviews().catch(() => {});
-  }, delay);
+  }, wait);
+}
+function scheduleTasksFallback() {
+  clearTimeout(tasksFallbackTimer);
+  tasksFallbackTimer = null;
+  if (!state.tasksOpen || document.hidden) return;
+  tasksFallbackTimer = setTimeout(
+    async () => {
+      tasksFallbackTimer = null;
+      try {
+        await refreshTaskOverviews();
+      } catch {
+        // The next fallback or live event can retry a failed read.
+      } finally {
+        scheduleTasksFallback();
+      }
+    },
+    state.eventStreamConnected ? 15_000 : 5000,
+  );
 }
 async function refreshTaskOverviews(force = false) {
-  if (!state.tasksOpen || state.tasksRefreshing) return;
+  if (!state.tasksOpen || document.hidden || state.tasksRefreshing) return;
   const ids = [...state.taskTrackedIds].filter(
     (threadId) =>
       force ||
@@ -1440,6 +1690,7 @@ async function refreshTaskOverviews(force = false) {
   );
   if (!ids.length) return renderTaskOverviews();
   state.tasksRefreshing = true;
+  lastTaskOverviewRefresh = Date.now();
   $("tasksBtn").classList.add("refreshing");
   for (const threadId of ids) state.taskDirtyIds.delete(threadId);
   try {
@@ -1461,7 +1712,6 @@ async function refreshTaskOverviews(force = false) {
         } catch {
           if (!state.taskOverviews.has(threadId))
             state.taskOverviews.set(threadId, { error: true });
-          state.taskDirtyIds.add(threadId);
         }
       }),
     );
@@ -1469,6 +1719,7 @@ async function refreshTaskOverviews(force = false) {
     state.tasksRefreshing = false;
     $("tasksBtn").classList.remove("refreshing");
     renderTaskOverviews();
+    if (state.taskDirtyIds.size) scheduleTasksRefresh();
   }
 }
 function openTasksDialog() {
@@ -1479,12 +1730,15 @@ function openTasksDialog() {
   $("tasksDialog").hidden = false;
   renderTaskOverviews();
   refreshTaskOverviews(true).catch(() => {});
+  scheduleTasksFallback();
 }
 function closeTasksDialog() {
   state.tasksOpen = false;
   $("tasksDialog").hidden = true;
   clearTimeout(tasksRefreshTimer);
   tasksRefreshTimer = null;
+  clearTimeout(tasksFallbackTimer);
+  tasksFallbackTimer = null;
 }
 const THREAD_ARCHIVE_SWIPE_WIDTH = 76;
 let openThreadArchiveRow = null;
@@ -1713,9 +1967,50 @@ async function openSessionById(threadId, { fromHash = false, replaceHash = false
 function renderProjects() {
   const q = $("search").value.trim().toLowerCase(),
     root = $("projects");
+  const viewButton = $("sessionViewBtn"),
+    recent = state.sessionView === "recent",
+    viewLabel = tr(recent ? "projectSessions" : "recentSessions");
+  viewButton.setAttribute("aria-pressed", String(recent));
+  viewButton.setAttribute("aria-label", viewLabel);
+  viewButton.title = viewLabel;
   closeThreadArchiveSwipe();
   root.textContent = "";
   const pinned = state.pinnedThreads.filter((thread) => threadMatches(thread, q));
+  const recentThreads = recent
+    ? recentSidebarThreads(
+        state.recentThreads.filter((item) => threadMatches(item, q)),
+        pinned,
+      )
+    : null;
+  const visiblePinned = recentThreads?.pinned || pinned;
+  if (visiblePinned.length) {
+    const section = document.createElement("section"),
+      heading = document.createElement("div"),
+      list = document.createElement("div");
+    section.className = "pinned-section";
+    heading.className = "pinned-heading";
+    heading.innerHTML = '<span class="pinned-title"></span><span class="pinned-count"></span>';
+    heading.children[0].textContent = tr("pinnedSessions");
+    heading.children[1].textContent = `${visiblePinned.length}`;
+    list.className = "pinned-threads";
+    for (const thread of visiblePinned) list.appendChild(threadRow(thread));
+    section.append(heading, list);
+    root.appendChild(section);
+  }
+  if (recent) {
+    const list = document.createElement("div");
+    list.className = "recent-threads";
+    for (const thread of recentThreads.recent) list.appendChild(threadRow(thread));
+    if (!list.childElementCount && !visiblePinned.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.style.padding = "12px";
+      empty.textContent = tr(state.recentThreadsLoading ? "loadingSessions" : "noRecentSessions");
+      list.appendChild(empty);
+    }
+    root.appendChild(list);
+    return;
+  }
   const matchingProjects = state.projects.filter(
     (p) =>
       `${p.kind === "chats" ? tr("chats") : p.name} ${p.kind === "chats" ? "" : p.path}`
@@ -1736,20 +2031,6 @@ function renderProjects() {
   if (!projects.length && !pinned.length) {
     root.innerHTML = `<div class="empty" style="padding:12px">${tr("noMatchingProjects")}</div>`;
     return;
-  }
-  if (pinned.length) {
-    const section = document.createElement("section"),
-      heading = document.createElement("div"),
-      list = document.createElement("div");
-    section.className = "pinned-section";
-    heading.className = "pinned-heading";
-    heading.innerHTML = '<span class="pinned-title"></span><span class="pinned-count"></span>';
-    heading.children[0].textContent = tr("pinnedSessions");
-    heading.children[1].textContent = `${pinned.length}`;
-    list.className = "pinned-threads";
-    for (const thread of pinned) list.appendChild(threadRow(thread));
-    section.append(heading, list);
-    root.appendChild(section);
   }
   function projectNode(p, children = []) {
     const wrap = document.createElement("section");
@@ -1933,7 +2214,7 @@ function openProjectlessDraft() {
   state.followMessageTail = true;
   state.pending = [];
   setMessageSyncPhase(null);
-  $("messages").replaceChildren();
+  clearMessageTimeline();
   $("threadTitle").textContent = tr("newChat");
   $("threadCompactMeta").textContent = tr("chats");
   $("threadMeta").textContent = tr("newChatHelp");
@@ -3290,6 +3571,24 @@ function appendContextValue(details, value, label) {
 }
 function contentNode(item, threadId = state.current?.id) {
   if (item.kind === "text") return markdownNode(item.text, markdownOptions(threadId));
+  if (item.kind === "goal") {
+    const details = document.createElement("details"),
+      summary = document.createElement("summary"),
+      label = document.createElement("span"),
+      preview = document.createElement("span"),
+      full = document.createElement("div");
+    details.className = "context-block goal-trigger-content";
+    label.className = "goal-trigger-label";
+    label.textContent = tr("goalUpdated");
+    preview.className = "goal-trigger-preview";
+    preview.textContent = item.text || "";
+    full.className = "goal-trigger-full";
+    full.textContent = item.text || "";
+    summary.append(label, preview);
+    details.append(summary, full);
+    preserveMessageDisclosureOnClick(details, summary);
+    return details;
+  }
   if (item.kind === "pasted_text") {
     const button = document.createElement("button"),
       icon = document.createElement("span");
@@ -3817,6 +4116,36 @@ function updateLiveCommandNodes(itemId) {
 }
 const renderedMessageState = new WeakMap();
 
+async function showToolGroupSummary(threadId, messageIndex) {
+  const dialog = document.createElement("dialog"),
+    header = document.createElement("div"),
+    title = document.createElement("h2"),
+    close = document.createElement("button"),
+    body = document.createElement("div");
+  dialog.className = "tool-summary-dialog";
+  header.className = "tool-summary-dialog-header";
+  title.textContent = tr("toolGroupSummary");
+  close.type = "button";
+  close.textContent = tr("close");
+  close.onclick = () => dialog.close();
+  body.className = "tool-summary-dialog-body";
+  body.textContent = tr("toolGroupSummarizing");
+  header.append(title, close);
+  dialog.append(header, body);
+  document.body.appendChild(dialog);
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  dialog.showModal();
+  try {
+    const summary = await command(
+      { command: "tool_group_summarize", thread_id: threadId, message_index: messageIndex },
+      false,
+    );
+    if (dialog.open) body.replaceChildren(markdownNode(summary.text));
+  } catch (error) {
+    if (dialog.open) body.textContent = error.message;
+  }
+}
+
 function toolGroupNode(
   message,
   activeToolCallId = null,
@@ -3894,6 +4223,20 @@ function toolGroupNode(
   }
   if (hasImage) summary.appendChild(toolImageIndicator());
   group.appendChild(summary);
+  if (tools.length && !running && Number.isInteger(message.message_index) && threadId) {
+    const summarize = document.createElement("button");
+    summarize.className = "tool-group-summarize";
+    summarize.type = "button";
+    summarize.textContent = "✦";
+    summarize.title = tr("toolGroupSummary");
+    summarize.setAttribute("aria-label", summarize.title);
+    summarize.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void showToolGroupSummary(threadId, message.message_index);
+    };
+    group.appendChild(summarize);
+  }
   const list = document.createElement("div");
   list.className = "tool-list";
   for (const [toolPosition, tool] of tools.entries()) {
@@ -4508,7 +4851,7 @@ function messageNode(
   turnRunning = false,
 ) {
   const box = document.createElement("article");
-  box.className = `message ${m.category || m.role || ""}`;
+  box.className = `message ${m.category || m.role || ""}${m.goal_trigger ? " goal-trigger" : ""}`;
   box.dataset.messageKey = messageIdentity(m);
   box.dataset.messageIndex = String(m.message_index);
   if (m.turn_id) box.dataset.turnId = m.turn_id;
@@ -4534,7 +4877,7 @@ function messageNode(
     ),
     usageItems = content.filter((item) => item.kind === "turn_usage"),
     memoryItems = content.filter((item) => item.kind === "memory_citation");
-  const collapsibleRole = m.role === "assistant" || m.role === "user",
+  const collapsibleRole = !m.goal_trigger && (m.role === "assistant" || m.role === "user"),
     messageOutput = collapsibleRole ? document.createElement("div") : body;
   if (collapsibleRole) {
     messageOutput.className = `${m.role}-output collapse-candidate`;
@@ -4781,7 +5124,8 @@ function reconcileMessageNodes(root, response) {
       );
     } else nodes.push(liveTool);
   }
-  if (!messages.length) {
+  nodes.push($("outboxTray"));
+  if (!messages.length && !state.pending.some((entry) => entry.thread_id === state.current?.id)) {
     const empty = root.querySelector(":scope > .empty") || document.createElement("div");
     empty.className = "empty";
     empty.textContent = tr("noMessages");
@@ -4800,7 +5144,12 @@ function reconcileMessageNodes(root, response) {
     cursor.remove();
     cursor = next;
   }
-  requestAnimationFrame(() => syncLongMessages(root));
+  scheduleMessageLayoutSync();
+}
+
+function clearMessageTimeline() {
+  const tray = $("outboxTray");
+  $("messages").replaceChildren(tray);
 }
 
 function liveToolActivityNode(root = $("messages")) {
@@ -5024,7 +5373,34 @@ function renderPending() {
     cursor = next;
   }
   tray.hidden = !tray.childElementCount;
+  if (entries.length) $("messages").querySelector(":scope > .empty")?.remove();
   syncOutboxCompactLabel();
+  schedulePendingFallback();
+  if (state.followMessageTail && entries.length) requestAnimationFrame(scheduleMessageTailLock);
+}
+let pendingFallbackTimer = null;
+function schedulePendingFallback(reset = false) {
+  const shouldPoll =
+    state.eventStreamConnected &&
+    state.pending.some((entry) => entry.thread_id === state.current?.id);
+  if (reset || !shouldPoll) {
+    clearTimeout(pendingFallbackTimer);
+    pendingFallbackTimer = null;
+  }
+  if (pendingFallbackTimer !== null || !shouldPoll) return;
+  pendingFallbackTimer = setTimeout(
+    async () => {
+      pendingFallbackTimer = null;
+      try {
+        await refreshPending();
+      } catch {
+        // Keep the pending card available while the server is unreachable.
+      } finally {
+        schedulePendingFallback();
+      }
+    },
+    document.hidden ? 30_000 : 5000,
+  );
 }
 function syncOutboxCompactLabel() {
   const tray = $("outboxTray"),
@@ -5390,12 +5766,23 @@ function turnNavigationState(direction) {
 }
 function updateTurnNavigation() {
   const navigation = $("turnNavigation"),
-    hasTurns = $("messages").querySelectorAll(":scope > .turn-group").length > 1;
-  navigation.hidden = !state.current || !hasTurns;
+    turns = $("messages").querySelectorAll(":scope > .turn-group");
+  navigation.hidden = !state.current || turns.length < 2;
   if (navigation.hidden) return;
-  $("previousTurnBtn").disabled = turnNavigationState("up").index < 0;
+  const viewportTop = messageViewportTop() + 8,
+    positions = [...turns].map((turn) => turn.getBoundingClientRect().top);
+  $("previousTurnBtn").disabled = adjacentTurnIndex(positions, viewportTop, "up") < 0;
   $("nextTurnBtn").disabled =
-    messageBottomDistance(messageScrollMetrics()) < 2 || turnNavigationState("down").index < 0;
+    messageBottomDistance(messageScrollMetrics()) < 2 ||
+    adjacentTurnIndex(positions, viewportTop, "down") < 0;
+}
+let turnNavigationFrame = 0;
+function scheduleTurnNavigationUpdate() {
+  if (turnNavigationFrame) return;
+  turnNavigationFrame = requestAnimationFrame(() => {
+    turnNavigationFrame = 0;
+    updateTurnNavigation();
+  });
 }
 function scrollToAdjacentTurn(direction) {
   if (direction === "down" && messageBottomDistance(messageScrollMetrics()) < 2)
@@ -5443,7 +5830,7 @@ function setUsageUnavailable(error) {
   renderPending();
 }
 async function refreshComposerStatus() {
-  if (!state.current) return;
+  if (!state.current || document.hidden) return;
   const usage = $("usageState"),
     health = $("usageHealth"),
     effort = $("effortState");
@@ -5705,6 +6092,26 @@ async function pollActivity() {
     state.polling = false;
   }
 }
+let activityFallbackTimer = null;
+function scheduleActivityFallback() {
+  clearTimeout(activityFallbackTimer);
+  activityFallbackTimer = null;
+  if (state.eventStreamConnected || !state.current || state.current.projectless_draft) return;
+  const hasPending = state.pending.some((entry) => entry.thread_id === state.current.id);
+  let delay = 10_000;
+  if (document.hidden) delay = 30_000;
+  else if (state.activeTurnId || hasPending) delay = 1500;
+  activityFallbackTimer = setTimeout(async () => {
+    activityFallbackTimer = null;
+    try {
+      await pollActivity();
+    } catch {
+      // Continue the fallback until the event stream recovers.
+    } finally {
+      scheduleActivityFallback();
+    }
+  }, delay);
+}
 let eventRefreshTimer = null;
 function scheduleEventRefresh(threadId, immediate = false, delay = null) {
   if (threadId !== state.current?.id) return;
@@ -5775,6 +6182,9 @@ function handleTemporaryAppServerEvent(method, params, threadId) {
 function handleBridgeEvent(event) {
   if (event?.type === "bridge_event_stream") {
     state.eventStreamConnected = event.status === "ready";
+    scheduleActivityFallback();
+    schedulePendingFallback(true);
+    scheduleTasksFallback();
     if (!state.eventStreamConnected) {
       setMessageSyncPhase("reconnecting");
       state.pendingChanges = true;
@@ -6255,11 +6665,22 @@ async function openThread(
       state.referenceDrafts.set(state.current.id, state.composerReference);
   }
   state.current = thread;
+  scheduleActivityFallback();
   renderAsyncQuestion();
   if (changedThread) applyThreadWriterLock({ state: "checking", read_only: true, reason: null });
   syncTemporaryForCurrent();
   if (changedThread) resetThreadViewState(thread);
+  if (changedThread && !thread.projectless_draft) {
+    $("effortState").textContent = tr("selectModel");
+    $("usageState").textContent = "";
+    $("usageHealth").hidden = true;
+    $("composerStatus").hidden = false;
+  }
   refreshComposerStatus().catch(() => {});
+  if (changedThread)
+    setTimeout(() => {
+      if (state.current?.id === thread.id) refreshComposerStatus().catch(() => {});
+    }, 1500);
   renderPending();
   if (!quiet) {
     state.userScrolled = false;
@@ -6282,7 +6703,7 @@ async function openThread(
     setMessageSyncPhase(validCached || !changedThread ? "reconnecting" : "loading");
   if (!quiet) {
     if (validCached) {
-      root.replaceChildren();
+      root.replaceChildren($("outboxTray"));
       state.visibleMessages = cached.messages;
       state.leadingTurnUsers = cached.leading_turn_users || [];
       reconcileMessageNodes(root, {
@@ -6293,7 +6714,7 @@ async function openThread(
       applyMessagePageState(cached);
       scrollMessagesToBottom("auto");
     } else {
-      root.replaceChildren();
+      root.replaceChildren($("outboxTray"));
       renderMessageTailStatus();
     }
   }
@@ -6429,7 +6850,7 @@ async function refreshCurrentSessionFromTools() {
   clearCurrentSessionMessageCaches(thread.id);
   state.userScrolled = false;
   state.followMessageTail = true;
-  $("messages").replaceChildren();
+  clearMessageTimeline();
   setMessageSyncPhase("reconnecting");
   await openThread(thread, { quiet: true, writeHash: false, reconnect: true });
   scrollMessagesToBottom("auto");
@@ -6726,6 +7147,7 @@ async function write(name) {
     action,
     status: `${action}ing`,
     source: "web_optimistic",
+    local_submission: true,
     after_message_index: state.lastMessageIndex ?? -1,
   });
   state.pendingInFlight.add(submissionId);
@@ -6772,10 +7194,17 @@ async function write(name) {
         )
         .catch(() => false);
       if (!confirmed) throw outcome.error;
+      const recovered = state.pending.find((entry) => entry.id === submissionId);
+      if (recovered) recovered.local_submission = true;
     }
     setComposerSubmitting(false);
     acknowledged = true;
     state.pendingInFlight.delete(submissionId);
+    const accepted = state.pending.find((entry) => entry.id === submissionId);
+    if (accepted) {
+      accepted.status = outcome.value?.status === "queued" ? "queued" : "accepted";
+      renderPending();
+    }
     state.composerAttachments = [];
     state.attachmentDrafts.delete(threadId);
     renderComposerAttachments();
@@ -6812,7 +7241,8 @@ $("projects").addEventListener("scroll", () => closeThreadArchiveSwipe(null, { i
   passive: true,
 });
 $("archived").onchange = () => run(loadProjects);
-$("reloadBtn").onclick = () => run(loadProjects);
+$("reloadBtn").onclick = () => window.location.reload();
+$("sessionViewBtn").onclick = toggleSessionView;
 $("tasksBtn").onclick = openTasksDialog;
 $("tasksCloseBtn").onclick = closeTasksDialog;
 $("tasksDialog").onclick = (event) => {
@@ -6820,8 +7250,28 @@ $("tasksDialog").onclick = (event) => {
 };
 $("statusBtn").onclick = () => run(loadStatus);
 $("settingsBtn").addEventListener("click", () => {
+  queueMicrotask(renderTrafficMonitor);
   if (!$("settingsPanel").hidden) run(refreshUsageWindows);
+  if (!$("settingsPanel").hidden) run(refreshWeeklyHistory);
 });
+for (const [scale, id] of [
+  ["day", "weeklyHistoryDay"],
+  ["hour", "weeklyHistoryHour"],
+]) {
+  $(id).onclick = () => {
+    weeklyHistoryScale = scale;
+    renderWeeklyHistory();
+  };
+}
+$("trafficMonitorToggle").onchange = (event) => {
+  trafficMonitor.setEnabled(event.currentTarget.checked);
+  renderTrafficMonitor();
+};
+$("trafficMonitorClear").onclick = () => {
+  trafficMonitor.clear();
+  renderTrafficMonitor();
+};
+renderTrafficMonitor();
 $("notificationBtn").onclick = () => run(toggleBrowserNotifications);
 $("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
@@ -7677,12 +8127,32 @@ window.addEventListener("pagehide", () => {
 });
 const refreshAfterResume = () => {
   if (!state.current || document.visibilityState === "hidden") return;
+  scheduleActivityFallback();
+  schedulePendingFallback(true);
+  if (state.tasksOpen) {
+    refreshTaskOverviews(true).catch(() => {});
+    scheduleTasksFallback();
+  }
   setMessageSyncPhase("reconnecting");
   state.pendingChanges = true;
   state.lastMessageRefresh = 0;
   pollActivity().catch(() => {});
 };
 document.addEventListener("visibilitychange", refreshAfterResume);
+document.addEventListener("visibilitychange", () => {
+  scheduleActivityFallback();
+  schedulePendingFallback(true);
+  if (document.hidden) {
+    clearTimeout(tasksRefreshTimer);
+    tasksRefreshTimer = null;
+  }
+  scheduleTasksFallback();
+  if (!document.hidden) {
+    refreshComposerStatus().catch(() => {});
+    refreshUsageWindows().catch(() => {});
+    refreshWeeklyHistory().catch(() => {});
+  }
+});
 window.addEventListener("focus", refreshAfterResume);
 window.addEventListener("online", refreshAfterResume);
 window.addEventListener("hashchange", () => {
@@ -7833,10 +8303,18 @@ $("messages").addEventListener(
   true,
 );
 const messageLayoutMutationObserver = new MutationObserver(() => {
-  syncLongMessages();
-  scheduleMessageTailLock();
-  updateTurnNavigation();
+  scheduleMessageLayoutSync();
 });
+let messageLayoutFrame = 0;
+function scheduleMessageLayoutSync() {
+  if (messageLayoutFrame) return;
+  messageLayoutFrame = requestAnimationFrame(() => {
+    messageLayoutFrame = 0;
+    syncLongMessages();
+    scheduleMessageTailLock();
+    scheduleTurnNavigationUpdate();
+  });
+}
 messageLayoutMutationObserver.observe($("messages"), { childList: true, subtree: true });
 document.fonts?.ready.then(() => {
   syncLongMessages();
@@ -7860,7 +8338,7 @@ const handleMessageScroll = () => {
     state.hasMore
   )
     run(loadOlder);
-  updateTurnNavigation();
+  scheduleTurnNavigationUpdate();
 };
 $("messages").onscroll = handleMessageScroll;
 window.addEventListener("scroll", handleMessageScroll, { passive: true });
@@ -7898,7 +8376,9 @@ document.querySelectorAll(".nav-toggle").forEach(
 );
 $("scrim").onclick = closePanels;
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
+initPasskeySettings(demoMode);
 renderUsageWindows();
+renderWeeklyHistory();
 renderBrowserNotifications();
 document.addEventListener("visibilitychange", renderBrowserNotifications);
 renderTasksButton();
@@ -7910,16 +8390,6 @@ run(async () => {
   subscribeEvents(handleBridgeEvent);
   await Promise.all([loadStatus(), loadInitialView()]);
 });
-setInterval(() => {
-  if (!state.eventStreamConnected) pollActivity().catch(() => {});
-}, 1500);
-setInterval(() => {
-  if (
-    state.eventStreamConnected &&
-    state.pending.some((entry) => entry.thread_id === state.current?.id)
-  )
-    refreshPending().catch(() => {});
-}, 5000);
-setInterval(() => refreshTaskOverviews().catch(() => {}), 1500);
 setInterval(() => refreshComposerStatus().catch(() => {}), 60000);
 setInterval(() => refreshUsageWindows().catch(() => {}), 300000);
+setInterval(() => refreshWeeklyHistory().catch(() => {}), 300000);

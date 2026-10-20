@@ -64,6 +64,7 @@ import { orderedTurnChildren, turnUsageHost } from "./turn-stack.js";
 import { trafficMonitor } from "./traffic-monitor.js";
 import { weeklyUsageBuckets } from "./weekly-usage-chart.js";
 import { initPasskeySettings } from "./passkey-settings.js";
+import { initSettingsPanel } from "./settings-panel.js";
 import {
   rememberSessionId,
   sessionHash,
@@ -7249,10 +7250,12 @@ $("tasksDialog").onclick = (event) => {
   if (event.target === $("tasksDialog")) closeTasksDialog();
 };
 $("statusBtn").onclick = () => run(loadStatus);
-$("settingsBtn").addEventListener("click", () => {
-  queueMicrotask(renderTrafficMonitor);
-  if (!$("settingsPanel").hidden) run(refreshUsageWindows);
-  if (!$("settingsPanel").hidden) run(refreshWeeklyHistory);
+$("settingsPanel").addEventListener("settings-page-change", (event) => {
+  if (event.detail.page === "connection") renderTrafficMonitor();
+  if (event.detail.page === "usage") {
+    run(refreshUsageWindows);
+    run(refreshWeeklyHistory);
+  }
 });
 for (const [scale, id] of [
   ["day", "weeklyHistoryDay"],
@@ -8376,6 +8379,7 @@ document.querySelectorAll(".nav-toggle").forEach(
 );
 $("scrim").onclick = closePanels;
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
+initSettingsPanel();
 initPasskeySettings(demoMode);
 renderUsageWindows();
 renderWeeklyHistory();

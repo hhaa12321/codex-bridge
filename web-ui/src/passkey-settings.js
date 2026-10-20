@@ -6,6 +6,7 @@ export function initPasskeySettings(demoMode) {
   const api = window.codexPasskeys;
   if (demoMode || !api?.supported()) {
     card.hidden = true;
+    document.querySelector('[data-settings-nav="account"]')?.setAttribute("hidden", "");
     return;
   }
   const list = document.getElementById("passkeyList");
@@ -78,7 +79,7 @@ export function initPasskeySettings(demoMode) {
       add.disabled = false;
     }
   });
-  document.getElementById("settingsBtn")?.addEventListener("click", () => {
-    if (!document.getElementById("settingsPanel").hidden) void refresh();
+  document.getElementById("settingsPanel")?.addEventListener("settings-page-change", (event) => {
+    if (event.detail.page === "account") void refresh();
   });
 }

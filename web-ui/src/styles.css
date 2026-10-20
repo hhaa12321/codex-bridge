@@ -727,26 +727,100 @@ aside {
 .sidebar-sessions #projects {
   flex: 1;
 }
-.sidebar-settings {
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: #0009;
+}
+.settings-overlay[hidden],
+.settings-window[hidden],
+.settings-page[hidden] {
+  display: none;
+}
+.settings-window {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-rows: 54px minmax(0, 1fr);
+  width: min(920px, 100%);
+  height: min(690px, calc(100dvh - 32px));
   min-height: 0;
-  flex: 1;
-  overflow: auto;
-  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  box-shadow: 0 24px 80px #0009;
 }
 .settings-head {
-  display: flex;
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 40px;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 12px;
+  gap: 8px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--line);
 }
 .settings-head h2 {
   margin: 0;
-  font-size: 14px;
+  font-size: 16px;
+  font-weight: 650;
 }
 .settings-head button {
-  min-height: 30px;
-  padding: 4px 8px;
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-radius: 9px;
+  font-size: 23px;
+  line-height: 1;
+}
+.settings-back {
+  visibility: hidden;
+}
+.settings-close {
+  justify-self: end;
+}
+.settings-nav {
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 10px;
+  border-right: 1px solid var(--line);
+  background: var(--panel2);
+}
+.settings-nav button {
+  display: block;
+  width: 100%;
+  margin: 0 0 3px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  text-align: left;
+  font-size: 13px;
+}
+.settings-nav button[hidden] {
+  display: none;
+}
+.settings-nav button[aria-current="page"] {
+  background: var(--active-thread);
+  color: var(--accent2);
+  font-weight: 650;
+}
+.settings-pages {
+  min-width: 0;
+  min-height: 0;
+}
+.settings-page {
+  height: 100%;
+  overflow: auto;
+  padding: 24px;
+  overscroll-behavior: contain;
+}
+.settings-page > .settings-card:last-child {
+  margin-bottom: 0;
 }
 .settings-card {
   margin-bottom: 10px;
@@ -939,6 +1013,66 @@ aside {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.4;
+}
+@media screen and (max-width: 800px) {
+  .settings-overlay {
+    padding: 0;
+  }
+  .settings-window {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: calc(54px + env(safe-area-inset-top)) minmax(0, 1fr);
+    width: 100%;
+    height: 100dvh;
+    border: 0;
+    border-radius: 0;
+  }
+  .settings-head {
+    padding: env(safe-area-inset-top) 12px 0;
+  }
+  .settings-head button {
+    width: 38px;
+    height: 38px;
+    min-height: 38px;
+  }
+  .settings-back {
+    visibility: visible;
+  }
+  .settings-window:not([data-mobile-detail="true"]) .settings-back {
+    visibility: hidden;
+  }
+  .settings-nav,
+  .settings-pages {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .settings-nav {
+    padding: 14px 16px calc(16px + env(safe-area-inset-bottom));
+    border: 0;
+    background: var(--panel);
+  }
+  .settings-nav button {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 52px;
+    margin-bottom: 1px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    font-size: 15px;
+  }
+  .settings-nav button::after {
+    content: "›";
+    color: var(--muted);
+    font-size: 23px;
+  }
+  .settings-window[data-mobile-detail="true"] .settings-nav,
+  .settings-window:not([data-mobile-detail="true"]) .settings-pages {
+    display: none;
+  }
+  .settings-page {
+    padding: 18px 16px calc(24px + env(safe-area-inset-bottom));
+  }
 }
 #notificationBtn[data-enabled="true"] {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--line));

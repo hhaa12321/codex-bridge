@@ -96,8 +96,13 @@ export function latestActivityMessages(messages) {
   });
 }
 
-export function activeToolGroupTarget(messages, activeTurnId, activeToolCallId = null) {
-  if (!activeTurnId) return null;
+export function activeToolGroupTarget(
+  messages,
+  activeTurnId,
+  activeToolCallId = null,
+  activityPhase = "tool",
+) {
+  if (!activeTurnId || activityPhase !== "tool") return null;
   const assistants = (messages || []).filter(
     (message) => message.turn_id === activeTurnId && message.role === "assistant",
   );

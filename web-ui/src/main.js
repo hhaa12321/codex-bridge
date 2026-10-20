@@ -5057,7 +5057,12 @@ function preserveToolDisclosure(previousGroups, previousTools, next) {
 function reconcileMessageNodes(root, response) {
   const sourceMessages = latestActivityMessages(response.messages),
     activeToolCallId = state.activityPhase === "tool" ? state.activeToolCallId : null,
-    activeTarget = activeToolGroupTarget(sourceMessages, state.activeTurnId, activeToolCallId),
+    activeTarget = activeToolGroupTarget(
+      sourceMessages,
+      state.activeTurnId,
+      activeToolCallId,
+      state.activityPhase,
+    ),
     matchedLiveTool = activeToolCallId
       ? activeTarget?.tools?.findLast((tool) => tool.call_id === activeToolCallId)
       : null,
@@ -6311,9 +6316,14 @@ function handleBridgeEvent(event) {
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = params.turn?.id || state.activeTurnId;
+      state.activityPhase = "model";
+      state.activeTool = null;
+      state.activeToolCallId = null;
+      state.liveAppServerTool = null;
       state.liveActivityOverlay = activeActivityOverlay(state.activeTurnId, "model");
       state.turnUsageBaseline = normalizeTokenUsage(state.threadStatistics);
       state.liveTurnUsage = null;
+      renderVisibleMessages();
       showActivity();
       renderAsyncQuestion();
     }
@@ -6387,6 +6397,7 @@ function handleBridgeEvent(event) {
       state.activeTool = null;
       state.activeToolCallId = null;
       state.liveActivityOverlay = completedActivityOverlay();
+      renderVisibleMessages();
       showActivity();
       renderAsyncQuestion();
     }

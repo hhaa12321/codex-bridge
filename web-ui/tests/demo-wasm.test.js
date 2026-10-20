@@ -1673,6 +1673,8 @@ test("only the last tool group in a running turn receives live state", () => {
     messages = [firstGroup, commentary, lastGroup, newestCommentary];
   assert.equal(activeToolGroupTarget(messages, "turn-a", "call-2"), lastGroup);
   assert.equal(activeToolGroupTarget(messages, "turn-a", null), lastGroup);
+  assert.equal(activeToolGroupTarget(messages, "turn-a", null, "model"), null);
+  assert.equal(activeToolGroupTarget(messages, "turn-a", null, "compacting"), null);
   assert.deepEqual(
     firstGroup.tools.map((tool) => tool.call_id),
     ["call-1"],
@@ -1685,6 +1687,18 @@ test("only the last tool group in a running turn receives live state", () => {
     activeToolGroupTarget([commentary, newestCommentary], "turn-a", "call-3"),
     newestCommentary,
   );
+});
+
+test("a new model phase ends the prior tool group's running presentation immediately", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const started = source.slice(
+    source.indexOf('} else if (method === "turn/started" && threadId)'),
+    source.indexOf('} else if (method === "item/started" && threadId'),
+  );
+  assert.match(started, /state\.activityPhase = "model"/);
+  assert.match(started, /state\.activeToolCallId = null/);
+  assert.match(started, /renderVisibleMessages\(\)/);
+  assert.match(source, /activeToolGroupTarget\([\s\S]*?state\.activityPhase,/);
 });
 
 test("streaming tool disclosure survives snapshot host changes", async () => {

@@ -925,10 +925,14 @@ aside {
   padding: 7px 0;
 }
 .passkey-row span {
+  flex: 1;
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 .passkey-row button {
   flex: none;
+  width: auto;
+  white-space: nowrap;
 }
 .settings-help {
   margin: -5px 0 8px;

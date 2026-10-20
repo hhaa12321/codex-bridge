@@ -21,10 +21,23 @@ export function mergeModelUsage(current = {}, previous = {}) {
   return merged;
 }
 
+export function mergeModelEffortUsage(current = {}, previous = {}) {
+  const merged = {};
+  for (const model of new Set([...Object.keys(previous), ...Object.keys(current)])) {
+    merged[model] = mergeModelUsage(current[model], previous[model]);
+  }
+  return merged;
+}
+
 export function modelUsageRows(statistics) {
-  const rows = Object.entries(statistics?.model_usage || {})
-    .map(([model, usage]) => ({ model, ...usage }))
-    .filter((row) => Number(row.total_tokens || 0) > 0);
+  const byEffort = statistics?.model_effort_usage || {};
+  const rows = (
+    Object.keys(byEffort).length
+      ? Object.entries(byEffort).flatMap(([model, efforts]) =>
+          Object.entries(efforts).map(([effort, usage]) => ({ model, effort, ...usage })),
+        )
+      : Object.entries(statistics?.model_usage || {}).map(([model, usage]) => ({ model, ...usage }))
+  ).filter((row) => Number(row.total_tokens || 0) > 0);
   const attributed = rows.reduce((sum, row) => sum + Number(row.total_tokens || 0), 0);
   const remaining = Math.max(0, Number(statistics?.total_tokens || 0) - attributed);
   if (remaining) {

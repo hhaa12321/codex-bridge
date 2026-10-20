@@ -27,7 +27,7 @@ import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18
 import { MAX_PASTED_TEXT_BYTES, shouldAttachPastedText } from "./large-paste.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
-import { mergeModelUsage, modelUsageRows } from "./model-usage.js";
+import { mergeModelEffortUsage, mergeModelUsage, modelUsageRows } from "./model-usage.js";
 import {
   shouldCollapseAssistantOutput,
   shouldCollapseUserMessage,
@@ -775,6 +775,10 @@ function mergeThreadStatistics(statistics) {
     merged[key] = Math.max(Number(statistics[key] || 0), Number(state.threadStatistics[key] || 0));
   }
   merged.model_usage = mergeModelUsage(statistics.model_usage, state.threadStatistics.model_usage);
+  merged.model_effort_usage = mergeModelEffortUsage(
+    statistics.model_effort_usage,
+    state.threadStatistics.model_effort_usage,
+  );
   return merged;
 }
 function renderThreadStatistics(statistics = state.threadStatistics) {
@@ -824,7 +828,18 @@ function renderThreadStatistics(statistics = state.threadStatistics) {
         const line = document.createElement("div");
         line.className = "thread-stat-model";
         const model = document.createElement("span");
-        model.textContent = row.model === "unknown" ? tr("sessionUnknownModel") : row.model;
+        const modelName = row.model === "unknown" ? tr("sessionUnknownModel") : row.model;
+        const effortNames = {
+          unknown: tr("sessionEffortUnknown"),
+          none: tr("sessionEffortNone"),
+          low: tr("sessionEffortLow"),
+          medium: tr("sessionEffortMedium"),
+          high: tr("sessionEffortHigh"),
+          xhigh: tr("sessionEffortXhigh"),
+          max: tr("sessionEffortMax"),
+        };
+        const effortName = row.effort ? effortNames[row.effort] || row.effort : null;
+        model.textContent = effortName ? `${modelName} · ${effortName}` : modelName;
         const total = document.createElement("strong");
         total.textContent = Number(row.total_tokens || 0).toLocaleString();
         const details = document.createElement("small");

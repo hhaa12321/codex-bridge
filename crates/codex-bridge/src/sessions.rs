@@ -716,8 +716,12 @@ pub struct ThreadStatistics {
     pub reasoning_output_tokens: u64,
     #[serde(default)]
     pub model_usage: BTreeMap<String, TokenUsageBreakdown>,
+    #[serde(default)]
+    pub model_effort_usage: BTreeMap<String, BTreeMap<String, TokenUsageBreakdown>>,
     #[serde(skip)]
     active_model: Option<String>,
+    #[serde(skip)]
+    active_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -770,9 +774,19 @@ impl ThreadStatistics {
             current.since(previous)
         };
         if delta.total_tokens > 0 {
+            let model = self
+                .active_model
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
             self.model_usage
+                .entry(model.clone())
+                .or_default()
+                .add(delta);
+            self.model_effort_usage
+                .entry(model)
+                .or_default()
                 .entry(
-                    self.active_model
+                    self.active_effort
                         .clone()
                         .unwrap_or_else(|| "unknown".to_owned()),
                 )
@@ -2615,6 +2629,10 @@ fn read_rollout_messages_from(
                     .pointer("/payload/model")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                statistics.active_effort = record
+                    .pointer("/payload/effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
             }
             continue;
         }
@@ -3533,6 +3551,33 @@ mod tests {
             .unwrap();
         assert_eq!(updated.statistics.model_usage["model-a"].total_tokens, 150);
         assert_eq!(updated.statistics.model_usage["model-b"].total_tokens, 100);
+    }
+
+    #[test]
+    fn session_statistics_attribute_token_deltas_to_model_and_effort() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-model-effort-usage.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"thread-model-effort","cwd":"/tmp/project"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"model-a","effort":"medium"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100,"input_tokens":80,"output_tokens":20}}}}"#,
+                r#"{"type":"turn_context","payload":{"model":"model-a","effort":"high"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":160,"input_tokens":130,"output_tokens":30}}}}"#,
+                r#"{"type":"turn_context","payload":{"model":"model-a"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":180,"input_tokens":145,"output_tokens":35}}}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let (_, _, page) = store
+            .read_message_page_profiled("thread-model-effort", None, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.statistics.model_usage["model-a"].total_tokens, 180);
+        let efforts = &page.statistics.model_effort_usage["model-a"];
+        assert_eq!(efforts["medium"].total_tokens, 100);
+        assert_eq!(efforts["high"].total_tokens, 60);
+        assert_eq!(efforts["unknown"].total_tokens, 20);
     }
 
     #[test]

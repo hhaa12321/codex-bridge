@@ -194,6 +194,7 @@ fn app_server_urls(address: SocketAddr) -> (String, String) {
 /// PATH `codex` if the app bundle is not found.
 fn default_desktop_codex() -> Result<PathBuf> {
     for path in [
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
         "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
         "/Applications/ChatGPT.app/Contents/Resources/codex",
     ] {

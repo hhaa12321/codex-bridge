@@ -66,7 +66,10 @@ const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
 const DEFAULT_WEB_UI_NAME: &str = "Codex App Server WebUI";
 const DEFAULT_WS_BRIDGE_ADDR: &str = "127.0.0.1:18790";
 const DEFAULT_WHISPER_ADDR: &str = "127.0.0.1:18792";
-const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
+const DESKTOP_CODEX_PATH: &str =
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
+const WRAPPER_DESKTOP_CODEX_PATH: &str =
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
 const LEGACY_DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_LOGIN: &str = include_str!("../../../web-ui/login.html");
@@ -1543,16 +1546,25 @@ fn default_codex_program() -> PathBuf {
 }
 
 fn desktop_codex_program() -> Option<PathBuf> {
-    [DESKTOP_CODEX_PATH, LEGACY_DESKTOP_CODEX_PATH]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
+    [
+        DESKTOP_CODEX_PATH,
+        WRAPPER_DESKTOP_CODEX_PATH,
+        LEGACY_DESKTOP_CODEX_PATH,
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
 }
 
 fn is_desktop_codex_program(program: &Path) -> bool {
-    [DESKTOP_CODEX_PATH, LEGACY_DESKTOP_CODEX_PATH]
-        .into_iter()
-        .any(|path| program == Path::new(path))
+    let resolved = fs::canonicalize(program).ok();
+    [
+        DESKTOP_CODEX_PATH,
+        WRAPPER_DESKTOP_CODEX_PATH,
+        LEGACY_DESKTOP_CODEX_PATH,
+    ]
+    .into_iter()
+    .any(|path| program == Path::new(path) || resolved.as_deref() == Some(Path::new(path)))
 }
 
 fn app_server_version_from_user_agent(user_agent: &str) -> Option<&str> {
@@ -1975,13 +1987,12 @@ fn stdio_app_server_pids(ps_output: &str, program: &Path) -> Vec<u32> {
         }
     }
     if is_desktop_codex_program(program) {
-        let app_bundle_binary = Path::new(DESKTOP_CODEX_PATH)
-            .parent()
-            .and_then(Path::parent)
-            .map(|dir| dir.join("CodexCLI.app/Contents/MacOS/codex"));
-        if let Some(binary) = app_bundle_binary {
-            programs.push(binary.to_string_lossy().into_owned());
-        }
+        programs.extend([
+            DESKTOP_CODEX_PATH.to_owned(),
+            WRAPPER_DESKTOP_CODEX_PATH.to_owned(),
+            LEGACY_DESKTOP_CODEX_PATH.to_owned(),
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/../CodexCLI.app/Contents/MacOS/codex".to_owned(),
+        ]);
     }
     let processes = ps_output
         .lines()
@@ -11654,6 +11665,10 @@ mod tests {
             stdio_app_server_pids(current_desktop_processes, nested_program),
             [11]
         );
+        assert!(is_desktop_codex_program(Path::new(DESKTOP_CODEX_PATH)));
+        assert!(is_desktop_codex_program(Path::new(
+            WRAPPER_DESKTOP_CODEX_PATH
+        )));
     }
 
     #[test]

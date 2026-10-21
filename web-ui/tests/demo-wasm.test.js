@@ -35,6 +35,21 @@ import { LARGE_PASTE_CHARS, shouldAttachPastedText } from "../src/large-paste.js
 import { orderedTurnChildren, turnUsageHost } from "../src/turn-stack.js";
 import { recentSidebarThreads } from "../src/project-state.js";
 import { createTrafficMonitor, monitoredJson } from "../src/traffic-monitor.js";
+import { createToolGroupClock, formatRunningToolDuration } from "../src/tool-duration.js";
+
+test("running tool group duration keeps its start across refreshes and formats by language", async () => {
+  const clock = createToolGroupClock(),
+    start = Date.parse("2026-10-21T00:00:00Z");
+  assert.equal(clock.startedAt("thread:call-a", "2026-10-21T00:00:00Z", start + 5000), start);
+  assert.equal(clock.startedAt("thread:call-a", null, start + 45_000), start);
+  assert.equal(formatRunningToolDuration(0, 59_000, "en"), "59 s");
+  assert.equal(formatRunningToolDuration(0, 60_000, "en"), "1 min");
+  assert.equal(formatRunningToolDuration(0, 2_400, "zh"), "2 秒");
+  assert.equal(formatRunningToolDuration(0, 120_000, "zh"), "2 分钟");
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /if \(running\) \{[\s\S]*?summary\.append\(runningToolDurationNode/);
+  assert.match(source, /syncRunningToolDurationTimer\(\);\s*scheduleMessageLayoutSync\(\)/);
+});
 
 test("Bridge traffic monitor is opt-in, bounded, and aggregates response bytes", async () => {
   const values = new Map();
@@ -1635,7 +1650,10 @@ test("live tool progress follows the exact newest call instead of animating stal
   assert.match(source, /activeTurnSection\.insertBefore\([\s\S]*?turn-live-usage/);
   assert.doesNotMatch(source, /nodes\.push\(liveToolActivityNode\(root\)\)/);
   assert.match(source, /method === "item\/started"/);
-  assert.match(source, /state\.liveAppServerTool = liveTool/);
+  assert.match(
+    source,
+    /state\.liveAppServerTool = \{ \.\.\.liveTool, startedAtMs: Date\.now\(\) \}/,
+  );
   assert.match(source, /state\.activeToolCallId = liveTool\.id/);
   assert.match(source, /method === "item\/completed"/);
   const toolGroup = source.slice(

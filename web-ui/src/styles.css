@@ -2970,6 +2970,12 @@ main.history-fullscreen .fullscreen-exit-icon {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.tool-group-duration {
+  flex: none;
+  margin-left: 8px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 @media (prefers-reduced-motion: reduce) {
   .tool-group-summary.running .tool-summary-label,
   .turn-live-usage {
@@ -2980,6 +2986,7 @@ main.history-fullscreen .fullscreen-exit-icon {
 }
 .tool-group > summary::after {
   content: "";
+  flex: none;
   width: 6px;
   height: 6px;
   margin: 0 0 3px 7px;

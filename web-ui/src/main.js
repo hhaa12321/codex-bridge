@@ -61,6 +61,7 @@ import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
 import { toolOutputImageUrls } from "./tool-image.js";
 import { orderedTurnChildren, turnUsageHost } from "./turn-stack.js";
+import { createToolGroupClock, formatRunningToolDuration } from "./tool-duration.js";
 import { trafficMonitor } from "./traffic-monitor.js";
 import { weeklyUsageBuckets } from "./weekly-usage-chart.js";
 import { initPasskeySettings } from "./passkey-settings.js";
@@ -4162,6 +4163,39 @@ async function showToolGroupSummary(threadId, messageIndex) {
   }
 }
 
+const toolGroupClock = createToolGroupClock();
+let runningToolDurationTimer = null;
+
+function runningToolDurationNode(key, candidate) {
+  const startedAt = toolGroupClock.startedAt(key, candidate);
+  const duration = document.createElement("span");
+  duration.className = "tool-group-duration";
+  duration.dataset.toolStartedAt = String(startedAt);
+  duration.textContent = formatRunningToolDuration(startedAt, Date.now(), getLanguage());
+  return duration;
+}
+
+function updateRunningToolDurations() {
+  for (const duration of $("messages").querySelectorAll(".tool-group-duration")) {
+    duration.textContent = formatRunningToolDuration(
+      Number(duration.dataset.toolStartedAt),
+      Date.now(),
+      getLanguage(),
+    );
+  }
+}
+
+function syncRunningToolDurationTimer() {
+  const running = !document.hidden && $("messages").querySelector(".tool-group-duration");
+  if (running && runningToolDurationTimer === null) {
+    updateRunningToolDurations();
+    runningToolDurationTimer = setInterval(updateRunningToolDurations, 1000);
+  } else if (!running && runningToolDurationTimer !== null) {
+    clearInterval(runningToolDurationTimer);
+    runningToolDurationTimer = null;
+  }
+}
+
 function toolGroupNode(
   message,
   activeToolCallId = null,
@@ -4218,6 +4252,11 @@ function toolGroupNode(
     toolFileList(tools, state.current?.cwd, 8) ||
     (running ? latest.preview || latest.name : label.textContent);
   summary.append(icon, label);
+  if (running) {
+    const liveStart =
+      state.liveAppServerTool?.id === activeToolCallId ? state.liveAppServerTool.startedAtMs : null;
+    summary.append(runningToolDurationNode(groupKey, liveStart || message.timestamp));
+  }
   if (activityTitle && activityThreadIds(latest).length > 0) {
     summary.classList.add("subagent-link");
     summary.title = tr("openSubagentConversation", { name: activityTitle });
@@ -5165,12 +5204,14 @@ function reconcileMessageNodes(root, response) {
     cursor.remove();
     cursor = next;
   }
+  syncRunningToolDurationTimer();
   scheduleMessageLayoutSync();
 }
 
 function clearMessageTimeline() {
   const tray = $("outboxTray");
   $("messages").replaceChildren(tray);
+  syncRunningToolDurationTimer();
 }
 
 function liveToolActivityNode(root = $("messages")) {
@@ -5193,6 +5234,8 @@ function liveToolActivityNode(root = $("messages")) {
   label.className = "tool-summary-label";
   label.textContent = `${toolActionText(name, true)} ${name}`.trim();
   summary.append(icon, label);
+  const groupKey = `${state.current?.id || ""}:call:${state.activeToolCallId || state.activeTurnId}`;
+  summary.append(runningToolDurationNode(groupKey, state.liveAppServerTool?.startedAtMs));
   row.appendChild(summary);
   body.appendChild(row);
   if (state.liveAppServerTool?.id) {
@@ -6331,7 +6374,7 @@ function handleBridgeEvent(event) {
     const liveTool = appServerItemTool(params.item);
     if (liveTool) {
       if (isCommandTool(liveTool.name) && liveTool.id) liveCommandOutputs.set(liveTool.id, "");
-      state.liveAppServerTool = liveTool;
+      state.liveAppServerTool = { ...liveTool, startedAtMs: Date.now() };
       state.authoritativeThreadActive.set(threadId, true);
       state.activeTurnId = params.turnId || state.activeTurnId;
       state.activityPhase = "tool";
@@ -8169,6 +8212,7 @@ const refreshAfterResume = () => {
 };
 document.addEventListener("visibilitychange", refreshAfterResume);
 document.addEventListener("visibilitychange", () => {
+  syncRunningToolDurationTimer();
   scheduleActivityFallback();
   schedulePendingFallback(true);
   if (document.hidden) {

@@ -7523,13 +7523,27 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     Ok(result) => result,
                     Err(error) => return write_backend_error(error),
                 };
-                if result.get("deleted").and_then(Value::as_bool) != Some(true) {
-                    return Response::error(
-                        "pending_message_not_deleted",
-                        "the queued message has already left the app-server queue",
-                    );
+                if result.get("deleted").and_then(Value::as_bool) == Some(true) {
+                    true
+                } else {
+                    // A completed turn can leave an orphaned queue card when
+                    // the queue was drained between list and delete. Do not
+                    // restore it while a turn might still be consuming it.
+                    let thread = match write_backend.app_server_rpc(
+                        "thread/read",
+                        json!({"threadId": entry.thread_id, "includeTurns": false}),
+                    ) {
+                        Ok(thread) => thread,
+                        Err(error) => return write_backend_error(error),
+                    };
+                    if thread_result_is_active(&thread) {
+                        return Response::error(
+                            "pending_message_busy",
+                            "the queued message has left the queue and its turn is still active",
+                        );
+                    }
+                    false
                 }
-                true
             } else {
                 false
             };

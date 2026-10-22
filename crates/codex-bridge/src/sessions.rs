@@ -3096,6 +3096,11 @@ fn parse_wrapped_tool_calls(
                     )
                 })
                 .unwrap_or_else(|| serde_json::json!({"request": argument.trim()})),
+            "view_image" => decoded_argument.unwrap_or_else(|| {
+                js_string_field(argument, "path")
+                    .map(|path| serde_json::json!({"path": path}))
+                    .unwrap_or_else(|| serde_json::json!({"request": argument.trim()}))
+            }),
             _ => {
                 decoded_argument.unwrap_or_else(|| serde_json::json!({"request": argument.trim()}))
             }
@@ -4984,9 +4989,7 @@ text(await tools.web__run({search_query:[{q:"Codex app-server"}],response_length
         let tools = parse_wrapped_tool_calls("call-image", "completed", script).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "view_image");
-        assert!(tools[0].input["request"]
-            .as_str()
-            .is_some_and(|request| request.contains("/workspace/board.png")));
+        assert_eq!(tools[0].input["path"], "/workspace/board.png");
     }
 
     #[test]

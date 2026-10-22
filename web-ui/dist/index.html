@@ -10,8 +10,8 @@
     <link rel="icon" type="image/x-icon" href="/favicon.ico?v=f4d2cd6622e1" />
     <link rel="icon" type="image/png" sizes="512x512" href="/app-icon.png?v=6f9077d5595d" />
     <link rel="apple-touch-icon" href="/app-icon.png?v=6f9077d5595d" />
-    <script type="module" crossorigin src="/assets/app.js?v=fb6ce0b6aa84"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=eea4c642cc97">
+    <script type="module" crossorigin src="/assets/app.js?v=ac893227855c"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=817c59546e82">
   </head>
   <body>
     <div class="app">
@@ -292,6 +292,19 @@
                 >Projects and sessions appear on the left.</span
               ><span class="run-state" id="runState"></span>
             </div>
+            <button
+              class="goal-restore"
+              id="goalRestoreBtn"
+              type="button"
+              aria-expanded="false"
+              data-i18n-aria-label="showGoalPanel"
+              aria-label="Show goal panel"
+              hidden
+            >
+              <span class="goal-restore-arrow" aria-hidden="true">▸</span>
+              <span class="goal-trigger-label" data-i18n="goal">Goal</span>
+              <span class="goal-restore-preview" id="goalRestorePreview"></span>
+            </button>
           </div>
           <div class="head-actions">
             <button
@@ -730,16 +743,6 @@
         <span class="goal-action-help" id="goalActionHelp"></span>
       </footer>
     </aside>
-    <button
-      class="goal-restore"
-      id="goalRestoreBtn"
-      type="button"
-      data-i18n-aria-label="showGoalPanel"
-      aria-label="Show goal panel"
-      hidden
-    >
-      <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6" /></svg>
-    </button>
     <aside
       class="question-float"
       id="asyncQuestionPanel"

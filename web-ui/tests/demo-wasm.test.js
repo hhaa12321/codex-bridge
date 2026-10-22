@@ -1625,7 +1625,7 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
   assert.match(restoreView, /setMessageScrollTop\(view\.top\)/);
   const reconcile = source.slice(
     source.indexOf("function reconcileMessageNodes"),
-    source.indexOf("function clearMessageTimeline"),
+    source.indexOf("function liveCompactionNode"),
   );
   assert.doesNotMatch(reconcile, /replaceChildren/);
 });
@@ -1713,7 +1713,10 @@ test("a new model phase ends the prior tool group's running presentation immedia
     source.indexOf('} else if (method === "turn/started" && threadId)'),
     source.indexOf('} else if (method === "item/started" && threadId'),
   );
-  assert.match(started, /state\.activityPhase = "model"/);
+  assert.match(
+    started,
+    /state\.activityPhase = state\.liveCompaction\?\.phase === "running" \? "compacting" : "model"/,
+  );
   assert.match(started, /state\.activeToolCallId = null/);
   assert.match(started, /renderVisibleMessages\(\)/);
   assert.match(source, /activeToolGroupTarget\([\s\S]*?state\.activityPhase,/);
@@ -2055,7 +2058,7 @@ test("large-session deferred turns hydrate only after explicit expansion", async
   assert.doesNotMatch(source, /scheduleVisibleTurnHydration/);
 });
 
-test("goal is a collapsible right-side panel with typed pause resume and edit controls", async () => {
+test("goal starts as a single header line and expands only on request", async () => {
   assert.deepEqual(goalToggleState("blocked"), {
     canPause: false,
     canResume: true,
@@ -2085,13 +2088,20 @@ test("goal is a collapsible right-side panel with typed pause resume and edit co
   ]);
   assert.match(html, /id="goalPanel"[\s\S]*id="goalToggleBtn"/);
   assert.match(html, /id="goalHideBtn"[\s\S]*d="m9 6 6 6-6 6"/);
-  assert.match(html, /id="goalRestoreBtn"[\s\S]*d="m15 6-6 6 6 6"/);
+  assert.match(html, /class="thread-head"[\s\S]*id="goalRestoreBtn"[\s\S]*id="goalRestorePreview"/);
   assert.match(html, /id="goalEditDialog"[\s\S]*id="goalObjectiveInput"/);
   assert.match(source, /command: "thread_goal_get"/);
   assert.match(source, /command: "thread_goal_set"/);
   assert.match(source, /method === "thread\/goal\/updated"/);
+  assert.match(source, /let expandedGoalThreadId = null/);
+  assert.match(source, /const expanded = !!goal && expandedGoalThreadId === state\.current\?\.id/);
+  assert.match(source, /if \(!quiet\) \{[\s\S]*expandedGoalThreadId = null/);
+  assert.match(
+    source,
+    /function resetThreadViewState\(thread\) \{[\s\S]*expandedGoalThreadId = null/,
+  );
   assert.match(stylesheet, /\.goal-float\s*\{[^}]*position:\s*fixed;[^}]*right:/s);
-  assert.match(stylesheet, /\.goal-restore\s*\{[^}]*position:\s*fixed;[^}]*right:\s*0;/s);
+  assert.match(stylesheet, /\.goal-restore\s*\{[^}]*height:\s*21px;/s);
 });
 
 test("pending handoff matches multimodal user messages one-to-one", async () => {

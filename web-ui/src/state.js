@@ -92,6 +92,7 @@ export const state = {
   activeToolCallId: null,
   liveAppServerTool: null,
   liveActivityOverlay: null,
+  liveCompaction: null,
   composerSubmitting: false,
   interrupting: false,
   workspaceDiffPolling: false,

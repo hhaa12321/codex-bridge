@@ -336,8 +336,7 @@ aside {
   padding: 0;
   place-items: center;
 }
-.goal-icon-button svg,
-.goal-restore svg {
+.goal-icon-button svg {
   width: 17px;
   fill: none;
   stroke: currentColor;
@@ -428,23 +427,36 @@ aside {
   line-height: 1.35;
 }
 .goal-restore {
-  position: fixed;
-  top: clamp(110px, 24vh, 240px);
-  right: 0;
-  z-index: 18;
-  display: grid;
-  width: 34px;
-  min-height: 52px;
-  padding: 0 5px 0 7px;
-  place-items: center;
-  border-right: 0;
-  border-radius: 12px 0 0 12px;
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
-  background: color-mix(in srgb, var(--panel) 96%, transparent);
-  color: var(--accent);
-  box-shadow: -6px 8px 24px #0003;
-  backdrop-filter: blur(16px);
-  animation: goal-restore-in 0.16s ease-out;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: min(100%, 560px);
+  min-width: 0;
+  height: 21px;
+  margin-top: 3px;
+  padding: 0 3px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: left;
+}
+.goal-restore:hover,
+.goal-restore:focus-visible {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+.goal-restore-arrow {
+  flex: none;
+  width: 12px;
+  font-size: 12px;
+}
+.goal-restore-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .goal-edit-card {
   display: grid;
@@ -478,12 +490,6 @@ aside {
   from {
     opacity: 0;
     transform: translateX(18px);
-  }
-}
-@keyframes goal-restore-in {
-  from {
-    opacity: 0;
-    transform: translateX(100%);
   }
 }
 @media screen and (max-width: 800px) {
@@ -2355,8 +2361,22 @@ main.history-fullscreen .fullscreen-exit-icon {
   content: "";
 }
 .context-compaction-icon {
+  display: inline-block;
   color: var(--accent);
   font-size: 15px;
+}
+.live-compaction.running .context-compaction-icon {
+  animation: compacting-spin 1.5s linear infinite;
+}
+@keyframes compacting-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-compaction.running .context-compaction-icon {
+    animation: none;
+  }
 }
 .context-compaction-duration {
   grid-column: 4;

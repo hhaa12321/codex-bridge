@@ -14,7 +14,7 @@ import {
 } from "./api.js";
 import { goalToggleState } from "./goal-state.js";
 import { asyncQuestionReplyMode } from "./async-question-state.js";
-import { goalPanelKey, questionPanelKey, snapshotIsCurrent } from "./floating-panel-state.js";
+import { questionPanelKey, snapshotIsCurrent } from "./floating-panel-state.js";
 import { commandPickerTrigger } from "./command-picker.js";
 import {
   imageFileFromSource,
@@ -60,6 +60,11 @@ import {
 import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
 import { toolOutputImageUrls } from "./tool-image.js";
+import {
+  reconcileCompactionProgress,
+  startCompactionProgress,
+  updateCompactionProgress,
+} from "./compaction-progress.js";
 import { orderedTurnChildren, turnUsageHost } from "./turn-stack.js";
 import { createToolGroupClock, formatRunningToolDuration } from "./tool-duration.js";
 import { trafficMonitor } from "./traffic-monitor.js";
@@ -859,7 +864,7 @@ function renderThreadStatistics(statistics = state.threadStatistics) {
     grid.appendChild(item);
   }
 }
-let collapsedGoalKey = null;
+let expandedGoalThreadId = null;
 let goalStateVersion = 0;
 const asyncQuestionsByThread = new Map();
 const answeredAsyncQuestions = new Set();
@@ -1006,10 +1011,12 @@ function renderGoalPanel() {
   const goal = state.threadGoal,
     panel = $("goalPanel"),
     restore = $("goalRestoreBtn");
-  const key = goalPanelKey(state.current?.id, goal);
-  panel.hidden = !goal || collapsedGoalKey === key;
-  restore.hidden = !goal || collapsedGoalKey !== key;
+  const expanded = !!goal && expandedGoalThreadId === state.current?.id;
+  panel.hidden = !expanded;
+  restore.hidden = !goal || expanded;
+  restore.setAttribute("aria-expanded", String(expanded));
   if (!goal) return;
+  $("goalRestorePreview").textContent = goal.objective || "";
   const status = goal.status || "active",
     statusKey =
       {
@@ -1073,7 +1080,7 @@ async function setThreadGoal(change, successKey) {
   }
 }
 function setGoalPanelCollapsed(collapsed) {
-  collapsedGoalKey = collapsed ? goalPanelKey(state.current?.id, state.threadGoal) : null;
+  expandedGoalThreadId = collapsed ? null : state.current?.id;
   renderGoalPanel();
 }
 function openGoalEditDialog() {
@@ -5094,8 +5101,13 @@ function preserveToolDisclosure(previousGroups, previousTools, next) {
 }
 
 function reconcileMessageNodes(root, response) {
-  const sourceMessages = latestActivityMessages(response.messages),
-    activeToolCallId = state.activityPhase === "tool" ? state.activeToolCallId : null,
+  const sourceMessages = latestActivityMessages(response.messages);
+  state.liveCompaction = reconcileCompactionProgress(
+    state.liveCompaction,
+    { active_turn_id: state.activeTurnId },
+    sourceMessages,
+  );
+  const activeToolCallId = state.activityPhase === "tool" ? state.activeToolCallId : null,
     activeTarget = activeToolGroupTarget(
       sourceMessages,
       state.activeTurnId,
@@ -5184,8 +5196,19 @@ function reconcileMessageNodes(root, response) {
       );
     } else nodes.push(liveTool);
   }
+  if (state.liveCompaction?.threadId === state.current?.id) {
+    const notice = liveCompactionNode(root, state.liveCompaction);
+    const turn = state.liveCompaction.turnId;
+    const section = turn ? nodes.find((node) => node.dataset?.turnKey === `turn:${turn}`) : null;
+    if (section) section.appendChild(notice);
+    else nodes.push(notice);
+  } else root.querySelector(".live-compaction")?.remove();
   nodes.push($("outboxTray"));
-  if (!messages.length && !state.pending.some((entry) => entry.thread_id === state.current?.id)) {
+  if (
+    !messages.length &&
+    !state.liveCompaction &&
+    !state.pending.some((entry) => entry.thread_id === state.current?.id)
+  ) {
     const empty = root.querySelector(":scope > .empty") || document.createElement("div");
     empty.className = "empty";
     empty.textContent = tr("noMessages");
@@ -5206,6 +5229,24 @@ function reconcileMessageNodes(root, response) {
   }
   syncRunningToolDurationTimer();
   scheduleMessageLayoutSync();
+}
+
+function liveCompactionNode(root, progress) {
+  const notice = root.querySelector(".live-compaction") || document.createElement("section"),
+    row = document.createElement("div"),
+    icon = document.createElement("span"),
+    label = document.createElement("span");
+  notice.className = `message compaction live-compaction ${progress.phase}`;
+  row.className = "context-compaction-notice";
+  icon.className = "context-compaction-icon";
+  icon.textContent = "↻";
+  icon.setAttribute("aria-hidden", "true");
+  label.textContent = tr(
+    progress.phase === "completed" ? "contextCompactionComplete" : "compacting",
+  );
+  row.append(icon, label);
+  notice.replaceChildren(row);
+  return notice;
 }
 
 function clearMessageTimeline() {
@@ -5864,7 +5905,7 @@ function scrollToAdjacentTurn(direction) {
   requestAnimationFrame(updateTurnNavigation);
 }
 function showActivity() {
-  const active = Boolean(state.activeTurnId),
+  const active = Boolean(state.activeTurnId || state.liveCompaction?.phase === "running"),
     el = $("runState"),
     label =
       state.activityPhase === "compacting"
@@ -6095,12 +6136,18 @@ async function refreshActivity() {
     state.liveActivityOverlay = null;
   }
   const projection = mergeActivityProjection(effectiveActivity, state.liveActivityOverlay);
+  state.liveCompaction = reconcileCompactionProgress(
+    state.liveCompaction,
+    effectiveActivity,
+    state.visibleMessages,
+  );
   state.activeTurnId = effectiveActiveTurnId(
     projection.activeTurnId,
     authoritativeActive,
     state.activeTurnId,
   );
-  state.activityPhase = projection.activityPhase;
+  state.activityPhase =
+    state.liveCompaction?.phase === "running" ? "compacting" : projection.activityPhase;
   state.activeTool = projection.activeTool;
   state.activeToolCallId = projection.activeToolCallId;
   if (previousPhase !== state.activityPhase || previousToolCallId !== state.activeToolCallId) {
@@ -6350,6 +6397,7 @@ function handleBridgeEvent(event) {
   if (method === "thread/status/changed" && threadId) {
     updateThreadLiveFromStatus(threadId, params.status);
   } else if (method === "turn/started" && threadId) {
+    state.liveCompaction = updateCompactionProgress(state.liveCompaction, method, params);
     if (threadId === state.current?.id && state.editableInterruptedTurn) {
       state.editableInterruptedTurn = null;
       renderVisibleMessages();
@@ -6359,7 +6407,7 @@ function handleBridgeEvent(event) {
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = params.turn?.id || state.activeTurnId;
-      state.activityPhase = "model";
+      state.activityPhase = state.liveCompaction?.phase === "running" ? "compacting" : "model";
       state.activeTool = null;
       state.activeToolCallId = null;
       state.liveAppServerTool = null;
@@ -6371,6 +6419,18 @@ function handleBridgeEvent(event) {
       renderAsyncQuestion();
     }
   } else if (method === "item/started" && threadId === state.current?.id) {
+    if (params.item?.type === "contextCompaction") {
+      state.liveCompaction = updateCompactionProgress(state.liveCompaction, method, params);
+      state.authoritativeThreadActive.set(threadId, true);
+      state.activeTurnId = params.turnId || state.activeTurnId;
+      state.activityPhase = "compacting";
+      state.activeTool = null;
+      state.activeToolCallId = null;
+      state.liveAppServerTool = null;
+      state.liveActivityOverlay = activeActivityOverlay(state.activeTurnId, "compacting");
+      renderVisibleMessages();
+      showActivity();
+    }
     const liveTool = appServerItemTool(params.item);
     if (liveTool) {
       if (isCommandTool(liveTool.name) && liveTool.id) liveCommandOutputs.set(liveTool.id, "");
@@ -6396,6 +6456,14 @@ function handleBridgeEvent(event) {
       updateLiveCommandNodes(params.itemId);
     }
   } else if (method === "item/completed" && threadId === state.current?.id) {
+    const previousCompaction = state.liveCompaction;
+    state.liveCompaction = updateCompactionProgress(state.liveCompaction, method, params);
+    if (previousCompaction !== state.liveCompaction) {
+      state.activityPhase = state.activeTurnId ? "model" : null;
+      state.liveActivityOverlay = activeActivityOverlay(state.activeTurnId, "model");
+      renderVisibleMessages();
+      showActivity();
+    }
     const completedTool = appServerItemTool(params.item);
     if (completedTool?.id) liveCommandOutputs.delete(completedTool.id);
     if (completedTool && state.liveAppServerTool?.id === completedTool.id) {
@@ -6416,6 +6484,7 @@ function handleBridgeEvent(event) {
     renderVisibleMessages();
     if (followTail) requestAnimationFrame(() => scrollMessagesToBottom("auto"));
   } else if (method === "turn/completed" && threadId) {
+    state.liveCompaction = updateCompactionProgress(state.liveCompaction, method, params);
     if (threadId === state.current?.id) {
       setTimeout(() => refreshEditableInterruptedTurn(threadId), 350);
     }
@@ -6676,6 +6745,7 @@ function yieldToBrowser() {
 }
 function resetThreadViewState(thread) {
   closeCommandPicker();
+  expandedGoalThreadId = null;
   goalStateVersion++;
   state.threadGoal = null;
   renderGoalPanel();
@@ -6693,6 +6763,7 @@ function resetThreadViewState(thread) {
   state.activeToolCallId = null;
   state.liveAppServerTool = null;
   state.liveActivityOverlay = null;
+  state.liveCompaction = null;
   state.pendingChanges = false;
   state.repairRequired = false;
   state.threadStatistics = null;
@@ -6727,6 +6798,8 @@ async function openThread(
   if (!quiet) {
     closePanels();
     setThreadHeaderExpanded(false);
+    expandedGoalThreadId = null;
+    renderGoalPanel();
   }
   if (changedThread && state.current) {
     saveDraft(state.current.id, $("messageText").value, true);
@@ -7491,6 +7564,7 @@ function clearArchivedCurrentThread(threadId) {
   state.activeTurnId = null;
   state.activeTool = null;
   state.activityPhase = null;
+  state.liveCompaction = null;
   state.messageCache.delete(threadId);
   $("threadTitle").textContent = tr("chooseSession");
   $("threadCompactMeta").textContent = "";
@@ -7760,9 +7834,15 @@ async function selectCommandPickerItem(item) {
   if (item.id === "compact") {
     const threadId = state.current?.id;
     await command({ command: "thread_compact", thread_id: threadId });
-    if (state.current?.id === threadId && commandDraft) {
-      textarea.value = "";
-      saveDraft(threadId, "");
+    if (state.current?.id === threadId) {
+      state.liveCompaction = startCompactionProgress(threadId);
+      state.activityPhase = "compacting";
+      renderVisibleMessages();
+      showActivity();
+      if (commandDraft) {
+        textarea.value = "";
+        saveDraft(threadId, "");
+      }
     }
     notify(tr("compactStarted"));
   }

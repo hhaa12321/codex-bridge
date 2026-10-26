@@ -3,3 +3,4 @@
 /_site/
 .DS_Store
 .env*
+docs/MODIFICATION_PLAN.zh-CN.md

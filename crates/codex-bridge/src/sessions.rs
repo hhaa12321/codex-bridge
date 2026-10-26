@@ -1315,6 +1315,9 @@ impl SessionStore {
             }
             for project in project_index.projects.values() {
                 for path in &project.roots {
+                    if !projects.contains_key(path) && !path.is_dir() {
+                        continue;
+                    }
                     let entry = projects
                         .entry(path.clone())
                         .or_insert_with(|| ProjectSummary {
@@ -4145,6 +4148,7 @@ mod tests {
         let fixture = Fixture::new();
         let recent = fixture.path.join("recent-project");
         let empty = fixture.path.join("historical-project");
+        let stale = fixture.path.join("removed-project");
         fs::create_dir_all(&recent).unwrap();
         fs::create_dir_all(&empty).unwrap();
         let rollout = format!(
@@ -4155,7 +4159,8 @@ mod tests {
         let project_index = ThreadProjectIndex::from_app_server(
             &serde_json::json!({"data":[
                 {"id":"project-recent","name":"Recent","roots":[{"path":recent}],"recencyAt":1_788_767_500_u64,"updatedAt":1_788_767_400_u64},
-                {"id":"project-empty","name":"Historical","roots":[{"path":empty}],"recencyAt":null,"updatedAt":1_788_760_000_u64}
+                {"id":"project-empty","name":"Historical","roots":[{"path":empty}],"recencyAt":null,"updatedAt":1_788_760_000_u64},
+                {"id":"project-stale","name":"Removed","roots":[{"path":stale}],"recencyAt":null,"updatedAt":1_788_750_000_u64}
             ]}),
             &[serde_json::json!({"id":"thread-recent","projectId":"project-recent"})],
         );
@@ -4170,6 +4175,7 @@ mod tests {
         assert_eq!(historical.name, "Historical");
         assert_eq!(historical.thread_count, 0);
         assert_eq!(historical.updated_at_ms, 1_788_760_000_000);
+        assert!(!projects.iter().any(|project| project.path == stale));
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use write_backend::{
     StartedTurnReceipt, ThreadWriterState, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,7 +245,6 @@ pub enum Request {
         target: Option<String>,
         message_id: Option<String>,
     },
-    Pending,
     PendingMessages {
         thread_id: Option<String>,
     },
@@ -260,12 +259,6 @@ pub enum Request {
     PendingMessageStart {
         id: String,
         thread_id: String,
-    },
-    Approve {
-        id: u64,
-    },
-    Decline {
-        id: u64,
     },
     Interrupt {
         thread_id: Option<String>,
@@ -371,13 +364,10 @@ impl Request {
             Self::AsyncQuestionReply { .. } => "async_question_reply",
             Self::AudioTranscribe { .. } => "audio_transcribe",
             Self::Scroll { .. } => "scroll",
-            Self::Pending => "pending",
             Self::PendingMessages { .. } => "pending_messages",
             Self::PendingMessageDelete { .. } => "pending_message_delete",
             Self::PendingMessagesMerge { .. } => "pending_messages_merge",
             Self::PendingMessageStart { .. } => "pending_message_start",
-            Self::Approve { .. } => "approve",
-            Self::Decline { .. } => "decline",
             Self::Interrupt { .. } => "interrupt",
             Self::HostExec { .. } => "host_exec",
             Self::AppServerRpc { .. } => "app_server_rpc",

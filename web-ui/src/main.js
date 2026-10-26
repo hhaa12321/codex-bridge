@@ -7,11 +7,14 @@ import {
   notify,
   recordPerformance,
   requestFilePreview,
+  respondToServerRequest,
   uploadComposerFile,
   run,
   subscribeEvents,
   timeText,
 } from "./api.js";
+import { approvalRequestModel, approvalResponseFor } from "./approval-state.js";
+import { diagnostics } from "./client-diagnostics.js";
 import { goalToggleState } from "./goal-state.js";
 import { asyncQuestionReplyMode } from "./async-question-state.js";
 import { questionPanelKey, snapshotIsCurrent } from "./floating-panel-state.js";
@@ -70,6 +73,7 @@ import { createToolGroupClock, formatRunningToolDuration } from "./tool-duration
 import { trafficMonitor } from "./traffic-monitor.js";
 import { weeklyUsageBuckets } from "./weekly-usage-chart.js";
 import { initPasskeySettings } from "./passkey-settings.js";
+import { registerServiceWorker } from "./pwa.js";
 import { initSettingsPanel } from "./settings-panel.js";
 import {
   rememberSessionId,
@@ -111,6 +115,7 @@ import {
   mergeActivityProjection,
 } from "./thread-activity-state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
+applyTheme(storedTheme(), false);
 const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
 if (restoredExpandedProjects !== null) {
   state.expanded = restoredExpandedProjects;
@@ -487,15 +492,176 @@ function renderManagedServices() {
   }
 }
 
+function appendConnectionDiagnostic(root, label, value, status = null) {
+  const row = document.createElement("div"),
+    name = document.createElement("span"),
+    detail = document.createElement("strong");
+  row.className = "connection-diagnostic";
+  if (status) row.dataset.status = status;
+  name.textContent = label;
+  detail.textContent = value;
+  row.append(name, detail);
+  root.appendChild(row);
+}
+
+function renderConnectionDiagnostics(status) {
+  const root = $("connectionDiagnostics");
+  if (!root) return;
+  root.replaceChildren();
+  if (!status) return;
+  const backend = status.write_backend || {},
+    compatibility = status.codex_compatibility || {},
+    apiKey = status.api_key || {},
+    preflight = status.upgrade_preflight || {},
+    writer = preflight.selected_writer || {},
+    apiSourceKey = {
+      environment: "apiKeyEnvironment",
+      file: "apiKeyFile",
+      codex_config: "apiKeyCodexConfig",
+      missing: "apiKeyMissing",
+    }[apiKey.source],
+    writerKey =
+      {
+        owned: "writerOwned",
+        external: "writerExternal",
+        released: "writerReleased",
+        unavailable: "writerUnavailable",
+        unknown: "writerUnknown",
+      }[writer.state] || "writerUnknown";
+  const chip = $("bridgeChip"),
+    chipText = $("bridgeChipText"),
+    chipDot = $("bridgeChipDot");
+  if (chip && chipText && chipDot) {
+    const online = Boolean(backend.app_server_available);
+    chip.dataset.status = online ? "connected" : "offline";
+    chipText.textContent = tr(online ? "connectedClient" : "appServerOffline");
+    chipDot.dataset.status = online ? "connected" : "offline";
+  }
+  appendConnectionDiagnostic(root, tr("bridgeVersion"), status.bridge_version || tr("unknown"));
+  appendConnectionDiagnostic(
+    root,
+    tr("codexCliVersion"),
+    compatibility.cli_version || tr("unknown"),
+    compatibility.error ? "error" : "ok",
+  );
+  appendConnectionDiagnostic(
+    root,
+    tr("appServerVersion"),
+    backend.runtime_version || tr("appServerOffline"),
+    backend.app_server_available ? "ok" : "error",
+  );
+  appendConnectionDiagnostic(root, tr("schemaVersion"), backend.schema_version || tr("unknown"));
+  appendConnectionDiagnostic(
+    root,
+    tr("apiKeyStatus"),
+    tr(apiSourceKey || "unknown"),
+    apiKey.configured ? "ok" : "error",
+  );
+  appendConnectionDiagnostic(
+    root,
+    tr("baseUrlStatus"),
+    tr(apiKey.base_url_configured ? "configured" : "notConfigured"),
+    apiKey.base_url_configured ? "ok" : "warning",
+  );
+  appendConnectionDiagnostic(
+    root,
+    tr("publicHostname"),
+    status.public_origin || tr("loopbackOnly"),
+  );
+  appendConnectionDiagnostic(
+    root,
+    tr("activeTurns"),
+    String(Number(preflight.active_turns || 0)),
+    Number(preflight.active_turns || 0) > 0 ? "running" : null,
+  );
+  appendConnectionDiagnostic(
+    root,
+    tr("selectedWriter"),
+    tr(writerKey),
+    writer.state === "owned" ? "ok" : writer.read_only ? "warning" : null,
+  );
+  const error = compatibility.error;
+  if (error) {
+    const help = document.createElement("div");
+    help.className = "connection-diagnostic-error";
+    help.textContent = error;
+    root.appendChild(help);
+  }
+  renderClientDiagnostics();
+}
+
+function clientDiagnosticSummary(event) {
+  const time = Number(event.ts)
+      ? new Date(Number(event.ts)).toLocaleTimeString(getLanguage() === "zh" ? "zh-CN" : "en-US")
+      : "",
+    detail = [event.command, event.status || event.phase, event.writer_state]
+      .filter(Boolean)
+      .join(" · "),
+    duration = Number.isFinite(event.duration_ms) ? `${event.duration_ms}ms` : "";
+  return [time, event.type, detail, duration].filter(Boolean).join("  ");
+}
+
+function renderClientDiagnostics() {
+  const root = $("clientDiagnosticsLog");
+  if (!root) return;
+  const events = diagnostics.recent().slice(-40).reverse();
+  root.replaceChildren();
+  if (!events.length) {
+    const empty = document.createElement("div");
+    empty.className = "client-diagnostics-empty";
+    empty.textContent = tr("diagnosticsEmpty");
+    root.appendChild(empty);
+    return;
+  }
+  for (const event of events) {
+    const row = document.createElement("div"),
+      copy = document.createElement("span"),
+      meta = document.createElement("span");
+    row.className = "client-diagnostic-row";
+    row.dataset.event = event.type || "event";
+    copy.textContent = clientDiagnosticSummary(event);
+    meta.textContent = event.request_id || event.error_code || event.reason_code || "";
+    row.append(copy, meta);
+    root.appendChild(row);
+  }
+}
+
+function exportClientDiagnostics() {
+  try {
+    const payload = {
+      generated_at: new Date().toISOString(),
+      events: diagnostics.recent(),
+      connection: {
+        event_stream_connected: state.eventStreamConnected,
+        writer_state: state.threadWriterLock?.state || "unknown",
+        theme: document.documentElement.dataset.theme || "system",
+      },
+    };
+    const url = URL.createObjectURL(
+        new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
+      ),
+      link = document.createElement("a");
+    link.href = url;
+    link.download = `codex-bridge-diagnostics-${Date.now()}.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    notify(tr("diagnosticsExported"));
+  } catch {
+    notify(tr("diagnosticsExportFailed"), true);
+  }
+}
+
 async function loadStatus() {
   const r = await command({ command: "status" }, false),
     backend = r.write_backend || {};
+  state.bridgeStatus = r;
   state.directAppServer = Boolean(backend.app_server_available);
   state.appServerMode = backend.app_server_mode || null;
   state.managedServices = r.managed_services || null;
   state.serverCapabilities = r.capabilities || null;
   state.runtimeResources = r.runtime_resources || null;
   renderManagedServices();
+  renderConnectionDiagnostics(r);
   syncVoiceCapability();
   const appServer = state.directAppServer
     ? tr("directOnline")
@@ -883,8 +1049,9 @@ function renderAsyncQuestion() {
   const panel = $("asyncQuestionPanel"),
     restore = $("asyncQuestionRestoreBtn");
   const key = questionPanelKey(state.current?.id, question);
-  panel.hidden = !question || collapsedAsyncQuestionKey === key;
-  restore.hidden = !question || collapsedAsyncQuestionKey !== key;
+  const approvalPending = state.pendingApprovals.size > 0;
+  panel.hidden = !question || approvalPending || collapsedAsyncQuestionKey === key;
+  restore.hidden = !question || approvalPending || collapsedAsyncQuestionKey !== key;
   if (!question) {
     renderedAsyncQuestionKey = null;
     return;
@@ -952,6 +1119,86 @@ async function refreshAsyncQuestions(threadId) {
   asyncQuestionsByThread.set(threadId, Array.isArray(result.questions) ? result.questions : []);
   renderAsyncQuestion();
 }
+
+let approvalBusyId = null;
+
+function currentApprovalEntry() {
+  const entries = [...state.pendingApprovals.values()].sort(
+    (left, right) => left.model.id - right.model.id,
+  );
+  return entries.find((entry) => entry.threadId === state.current?.id) || entries[0] || null;
+}
+
+function renderApprovalPanel() {
+  const entry = currentApprovalEntry(),
+    panel = $("approvalPanel");
+  panel.hidden = !entry;
+  if (!entry) {
+    approvalBusyId = null;
+    renderAsyncQuestion();
+    return;
+  }
+  const { model } = entry,
+    [summary = "", ...detail] = model.lines;
+  $("approvalTitle").textContent = tr(
+    model.kind === "command"
+      ? "approvalCommandTitle"
+      : model.kind === "permissions"
+        ? "approvalPermissionsTitle"
+        : "approvalFileTitle",
+  );
+  $("approvalSummary").textContent = summary || tr("approvalNoDetails");
+  $("approvalDetail").textContent = detail.join("\n");
+  $("approvalDetail").hidden = detail.length === 0;
+  $("approvalState").textContent =
+    state.pendingApprovals.size > 1
+      ? tr("approvalWaitingCount", { count: state.pendingApprovals.size })
+      : approvalBusyId === model.id
+        ? tr("approvalSending")
+        : "";
+  const busy = approvalBusyId === model.id;
+  $("approvalAcceptBtn").disabled = busy;
+  $("approvalDeclineBtn").disabled = busy;
+  renderAsyncQuestion();
+}
+
+function observeApprovalRequest(request) {
+  const model = approvalRequestModel(request);
+  if (!model) return false;
+  state.pendingApprovals.set(model.id, {
+    request,
+    model,
+    threadId: request.params?.threadId || state.current?.id || null,
+  });
+  renderApprovalPanel();
+  return true;
+}
+
+function resolveApproval(decision) {
+  const entry = currentApprovalEntry();
+  if (!entry || approvalBusyId !== null) return;
+  const result = approvalResponseFor(entry.request, decision);
+  if (!result || !respondToServerRequest(entry.model.id, result)) {
+    notify(tr("approvalSendFailed"), true);
+    return;
+  }
+  approvalBusyId = entry.model.id;
+  renderApprovalPanel();
+}
+
+function finishApprovalResponse(event) {
+  const requestId = Number(
+    event.request_id || event.response?.request_id || event.response?.id || Number.NaN,
+  );
+  if (event.ok) {
+    if (Number.isSafeInteger(requestId)) state.pendingApprovals.delete(requestId);
+  } else {
+    notify(event.error || tr("approvalSendFailed"), true);
+  }
+  approvalBusyId = null;
+  renderApprovalPanel();
+}
+
 async function submitAsyncQuestion(event) {
   event.preventDefault();
   const question = currentAsyncQuestion();
@@ -1107,6 +1354,7 @@ async function toggleLanguage() {
   renderUsageWindows();
   renderWeeklyHistory();
   renderAsyncQuestion();
+  renderApprovalPanel();
   renderTasksButton();
   renderTaskOverviews();
   renderBrowserNotifications();
@@ -4576,9 +4824,30 @@ function renderMessageTailStatus(followTail = true) {
     });
 }
 
+let messageSyncReconnectTimer = null;
 function setMessageSyncPhase(phase = null) {
+  if (phase === "reconnecting") {
+    if (messageSyncReconnectTimer !== null || state.messageSyncPhase === "reconnecting") return;
+    messageSyncReconnectTimer = window.setTimeout(() => {
+      messageSyncReconnectTimer = null;
+      if (state.eventStreamConnected) return;
+      state.messageSyncPhase = "reconnecting";
+      diagnostics.record("message_sync", { phase: "reconnecting", status: "syncing" });
+      renderMessageTailStatus(true);
+    }, 1_500);
+    return;
+  }
+  if (messageSyncReconnectTimer !== null) {
+    window.clearTimeout(messageSyncReconnectTimer);
+    messageSyncReconnectTimer = null;
+  }
   const changed = state.messageSyncPhase !== phase;
   state.messageSyncPhase = phase;
+  if (changed)
+    diagnostics.record("message_sync", {
+      phase: phase || "ready",
+      status: phase ? "syncing" : "ready",
+    });
   renderMessageTailStatus(changed);
 }
 
@@ -5974,9 +6243,10 @@ async function refreshComposerStatus() {
   }
   if (state.current?.id !== threadId) return;
   const weekly = r.weekly_usage;
+  const weeklySupported = Boolean(r.weekly_usage_supported);
   state.composerModel = r.model || null;
   state.composerEffort = r.reasoning_effort || null;
-  state.usageUnavailable = !weekly;
+  state.usageUnavailable = weeklySupported && !weekly;
   usage.textContent = weekly ? tr("weeklyRemaining", { percent: weekly.remaining_percent }) : "";
   usage.title = weekly?.resets_at
     ? tr("resetsAt", {
@@ -5985,8 +6255,8 @@ async function refreshComposerStatus() {
         ),
       })
     : "";
-  health.hidden = Boolean(weekly);
-  health.title = r.weekly_usage_error?.message || "";
+  health.hidden = !weeklySupported || Boolean(weekly);
+  health.title = weeklySupported ? r.weekly_usage_error?.message || "" : "";
   effort.textContent = state.composerModel
     ? [state.composerModel, state.composerEffort].filter(Boolean).join(" · ")
     : tr("selectModel");
@@ -6224,6 +6494,7 @@ function scheduleActivityFallback() {
   }, delay);
 }
 let eventRefreshTimer = null;
+let threadWriterRefreshGeneration = 0;
 function scheduleEventRefresh(threadId, immediate = false, delay = null) {
   if (threadId !== state.current?.id) return;
   state.pendingChanges = true;
@@ -6291,12 +6562,31 @@ function handleTemporaryAppServerEvent(method, params, threadId) {
 }
 
 function handleBridgeEvent(event) {
+  if (event?.type === "app_server_request" && observeApprovalRequest(event.message)) return;
+  if (event?.type === "bridge_app_server_request_response") {
+    finishApprovalResponse(event);
+    return;
+  }
+  if (event?.type === "app_server" && event.message?.method === "serverRequest/resolved") {
+    const requestId = Number(event.message.params?.requestId);
+    if (Number.isSafeInteger(requestId) && state.pendingApprovals.delete(requestId)) {
+      approvalBusyId = null;
+      renderApprovalPanel();
+    }
+    return;
+  }
   if (event?.type === "bridge_event_stream") {
     state.eventStreamConnected = event.status === "ready";
     scheduleActivityFallback();
     schedulePendingFallback(true);
     scheduleTasksFallback();
-    if (!state.eventStreamConnected) {
+    if (state.eventStreamConnected) {
+      void refreshCurrentThreadWriter().catch(() => {});
+      if (state.messageSyncPhase === "reconnecting" && state.current)
+        scheduleEventRefresh(state.current.id, true);
+    } else {
+      approvalBusyId = null;
+      renderApprovalPanel();
       setMessageSyncPhase("reconnecting");
       state.pendingChanges = true;
       pollActivity().catch(() => {});
@@ -6313,6 +6603,22 @@ function handleBridgeEvent(event) {
     return;
   }
   if (event?.type === "bridge_app_server_connection") {
+    diagnostics.record("app_server_connection", {
+      status: event.status,
+      reason_code: event.reason_code,
+    });
+    if (event.status === "connected") {
+      void refreshCurrentThreadWriter().catch(() => {});
+      scheduleEventRefresh(state.current?.id, true);
+    } else {
+      state.pendingApprovals.clear();
+      approvalBusyId = null;
+      renderApprovalPanel();
+      setMessageSyncPhase("reconnecting");
+      state.pendingChanges = true;
+      schedulePendingFallback(true);
+      pollActivity().catch(() => {});
+    }
     loadStatus().catch(() => {});
     return;
   }
@@ -6576,7 +6882,7 @@ function resizeComposerTextarea() {
   if (!textarea || !composer || !shell || !threadHead) return;
   shell.classList.toggle("has-text", Boolean(textarea.value || state.composerAttachments.length));
   syncComposerPlaceholder();
-  const minimum = usesDocumentMessageScroll() ? 56 : 44;
+  const minimum = 44;
   textarea.style.height = `${minimum}px`;
   const viewportHeight = window.visualViewport?.height || window.innerHeight,
     composerChrome = Math.max(0, composer.getBoundingClientRect().height - minimum),
@@ -6622,14 +6928,9 @@ function syncFocusedComposerViewport() {
 }
 function syncComposerPlaceholder() {
   const textarea = $("messageText"),
-    shell = document.querySelector(".composer-shell"),
     queueOnly =
       $("sendMode").value === "send" && currentThreadQueueable() && !currentThreadWritable(),
-    compact =
-      usesDocumentMessageScroll() &&
-      !textarea.value &&
-      document.activeElement !== textarea &&
-      !shell.classList.contains("input-focused");
+    compact = usesDocumentMessageScroll() && !textarea.value;
   textarea.placeholder = tr(
     queueOnly
       ? compact
@@ -6868,21 +7169,7 @@ async function openThread(
   const stillCurrent = () => token === state.openToken && state.current?.id === thread.id;
   void refreshActivity().catch(() => {});
   void refreshEditableInterruptedTurn(thread.id);
-  void command({ command: "thread_watch", thread_id: thread.id }, false)
-    .then((watch) => {
-      if (!sameThread()) return;
-      updateThreadLiveFromStatus(thread.id, watch.thread?.status);
-      applyThreadWriterLock(watch.writer_lock);
-      void refreshEditableInterruptedTurn(thread.id);
-    })
-    .catch((error) => {
-      if (sameThread())
-        applyThreadWriterLock({
-          state: "unavailable",
-          read_only: true,
-          reason: error.message,
-        });
-    });
+  void refreshCurrentThreadWriter().catch(() => {});
   void command({ command: "pending_messages", thread_id: thread.id }, false)
     .then((pending) => {
       if (!sameThread() || pendingGeneration < pendingAppliedGeneration) return;
@@ -6928,6 +7215,11 @@ async function openThread(
   );
   state.messageCache.set(thread.id, r);
   state.current = { ...thread, ...r.thread };
+  $("threadTitle").textContent = state.current.title || state.current.id;
+  $("threadCompactMeta").textContent = state.current.git_branch || tr("noBranch");
+  $("threadMeta").textContent =
+    `${state.current.cwd} · ${state.current.git_branch || tr("noBranch")} · ${state.current.id}`;
+  renderProjects();
   renderGoalPanel();
   rememberSessionId(window.localStorage, state.current.id);
   if (writeHash) updateSessionHash(state.current.id, replaceHash);
@@ -7063,12 +7355,37 @@ function currentThreadQueueable() {
 function requireCurrentThreadWriter() {
   if (!currentThreadWritable()) throw new Error(tr("sessionReadOnly"));
 }
+async function refreshCurrentThreadWriter() {
+  const threadId = state.current?.id;
+  if (!threadId || state.current?.projectless_draft) return null;
+  const generation = ++threadWriterRefreshGeneration;
+  const current = () =>
+    generation === threadWriterRefreshGeneration && state.current?.id === threadId;
+  try {
+    const watch = await command({ command: "thread_watch", thread_id: threadId }, false);
+    if (!current()) return null;
+    updateThreadLiveFromStatus(threadId, watch.thread?.status);
+    applyThreadWriterLock(watch.writer_lock);
+    void refreshEditableInterruptedTurn(threadId);
+    return watch;
+  } catch (error) {
+    if (current()) {
+      applyThreadWriterLock({
+        state: "unavailable",
+        read_only: true,
+        reason: error.message,
+      });
+    }
+    throw error;
+  }
+}
 function applyThreadWriterLock(lock) {
   const normalized = lock || {
     state: "unavailable",
     read_only: true,
     reason: null,
   };
+  const previousState = state.threadWriterLock?.state;
   state.threadWriterLock = normalized;
   const notice = $("writerLockNotice"),
     button = $("writerLockBtn"),
@@ -7080,20 +7397,27 @@ function applyThreadWriterLock(lock) {
           ? "sessionLockReleased"
           : "sessionLockUnavailable";
   const draft = Boolean(state.current?.projectless_draft);
-  notice.hidden = !state.current || draft || stateName === "owned" || stateName === "checking";
+  const blocked = ["external", "released"].includes(stateName);
+  notice.hidden = !state.current || draft || !blocked;
   notice.textContent = notice.hidden ? "" : tr(noticeKey);
   notice.title = normalized.reason || notice.textContent;
-  button.hidden = !state.current || draft || ["checking", "unavailable"].includes(stateName);
+  button.hidden = !state.current || draft || stateName === "checking";
   button.disabled =
     stateName === "checking" || (stateName === "owned" && Boolean(state.activeTurnId));
   button.dataset.action = stateName === "owned" ? "release" : "acquire";
   button.textContent = tr(
     stateName === "owned"
       ? "releaseSessionLock"
-      : stateName === "external"
+      : ["external", "unavailable", "unknown"].includes(stateName)
         ? "retrySessionLock"
         : "acquireSessionLock",
   );
+  if (previousState !== stateName)
+    diagnostics.record("writer_state", {
+      previous_writer_state: previousState || "unknown",
+      writer_state: stateName,
+      reason_code: normalized.reason ? "backend_reason" : "none",
+    });
   const readOnly = !currentThreadWritable();
   $("copySessionIdBtn").disabled = !state.current?.id;
   $("relocateThreadBtn").disabled =
@@ -7102,7 +7426,7 @@ function applyThreadWriterLock(lock) {
     demoMode ||
     Boolean(state.activeTurnId) ||
     ["external", "released"].includes(stateName);
-  document.querySelector(".composer-shell").classList.toggle("read-only", readOnly);
+  document.querySelector(".composer-shell").classList.toggle("read-only", blocked && !draft);
   for (const id of [
     "renameThreadBtn",
     "archiveThreadBtn",
@@ -7374,11 +7698,6 @@ async function write(name) {
     setComposerSubmitting(false);
   }
 }
-function approval(name) {
-  const id = Number($("approvalId").value);
-  if (!Number.isSafeInteger(id) || id < 0) throw new Error(tr("validRequestId"));
-  return command({ command: name, id });
-}
 $("search").oninput = renderProjects;
 $("projects").addEventListener("scroll", () => closeThreadArchiveSwipe(null, { immediate: true }), {
   passive: true,
@@ -7387,13 +7706,41 @@ $("archived").onchange = () => run(loadProjects);
 $("reloadBtn").onclick = () => window.location.reload();
 $("sessionViewBtn").onclick = toggleSessionView;
 $("tasksBtn").onclick = openTasksDialog;
+$("mobileTasksBtn").onclick = () => {
+  $("mobileListActions").open = false;
+  openTasksDialog();
+};
+$("mobileReloadBtn").onclick = () => window.location.reload();
+$("mobileArchived").onchange = (event) => {
+  $("archived").checked = event.target.checked;
+  run(loadProjects);
+};
+$("mobileListActions").addEventListener("toggle", (event) => {
+  if (event.currentTarget.open) $("mobileArchived").checked = $("archived").checked;
+});
 $("tasksCloseBtn").onclick = closeTasksDialog;
 $("tasksDialog").onclick = (event) => {
   if (event.target === $("tasksDialog")) closeTasksDialog();
 };
 $("statusBtn").onclick = () => run(loadStatus);
+$("themeQuickToggle").onclick = () => {
+  applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+};
+$("bridgeChip").onclick = () => {
+  $("settingsBtn").click();
+  $("settingsPanel").querySelector('[data-settings-nav="connection"]')?.click();
+};
+$("diagnosticsRefreshBtn").onclick = () =>
+  run(async () => {
+    renderClientDiagnostics();
+    await diagnostics.flush();
+  });
+$("diagnosticsExportBtn").onclick = () => run(async () => exportClientDiagnostics());
 $("settingsPanel").addEventListener("settings-page-change", (event) => {
-  if (event.detail.page === "connection") renderTrafficMonitor();
+  if (event.detail.page === "connection") {
+    renderTrafficMonitor();
+    renderClientDiagnostics();
+  }
   if (event.detail.page === "usage") {
     run(refreshUsageWindows);
     run(refreshWeeklyHistory);
@@ -7482,6 +7829,8 @@ $("asyncQuestionRestoreBtn").onclick = () => {
   renderAsyncQuestion();
 };
 $("asyncQuestionForm").onsubmit = (event) => run(() => submitAsyncQuestion(event));
+$("approvalAcceptBtn").onclick = () => resolveApproval("accept");
+$("approvalDeclineBtn").onclick = () => resolveApproval("decline");
 $("goalRestoreBtn").onclick = () => setGoalPanelCollapsed(false);
 $("goalEditBtn").onclick = openGoalEditDialog;
 $("goalEditCancelBtn").onclick = closeGoalEditDialog;
@@ -8039,8 +8388,6 @@ $("scrollBtn").onclick = () =>
     req[mode] = mode === "pixels" ? Number(v) : v;
     return command(req);
   });
-$("approveBtn").onclick = () => run(() => approval("approve"));
-$("declineBtn").onclick = () => run(() => approval("decline"));
 $("execBtn").onclick = () =>
   run(async () => {
     let argv;
@@ -8279,6 +8626,7 @@ window.addEventListener("pagehide", () => {
 });
 const refreshAfterResume = () => {
   if (!state.current || document.visibilityState === "hidden") return;
+  diagnostics.record("resume_refresh", { visible: true, visibility: document.visibilityState });
   scheduleActivityFallback();
   schedulePendingFallback(true);
   if (state.tasksOpen) {
@@ -8323,10 +8671,9 @@ const composer = document.querySelector(".composer"),
   mainPanel = document.querySelector("main"),
   threadHead = document.querySelector(".thread-head"),
   syncFrameInsets = () => {
-    mainPanel.style.setProperty(
-      "--composer-height",
-      `${Math.ceil(composer.getBoundingClientRect().height)}px`,
-    );
+    const composerHeight = `${Math.ceil(composer.getBoundingClientRect().height)}px`;
+    document.documentElement.style.setProperty("--composer-height", composerHeight);
+    mainPanel.style.setProperty("--composer-height", composerHeight);
     mainPanel.style.setProperty(
       "--thread-head-height",
       `${Math.ceil(threadHead.getBoundingClientRect().height)}px`,
@@ -8534,10 +8881,10 @@ initPasskeySettings(demoMode);
 renderUsageWindows();
 renderWeeklyHistory();
 renderBrowserNotifications();
+registerServiceWorker();
 document.addEventListener("visibilitychange", renderBrowserNotifications);
 renderTasksButton();
 setSendMode("steer", false);
-applyTheme(storedTheme(), false);
 watchSystemTheme();
 run(async () => {
   await authenticate();

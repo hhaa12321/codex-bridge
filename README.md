@@ -4,19 +4,28 @@ Access OpenAI Codex app-server from a responsive Web UI or CLI running on your h
 mini, or Linux host. Continue the same tasks from any device while Codex stays beside your
 repositories.
 
-<img width="1319" height="1038" alt="图片" src="https://github.com/user-attachments/assets/2bb8da3b-c8d8-4f20-b758-d34e28a4950b" />
+[<img src="docs/assets/codex-bridge-mobile.jpg" alt="Codex Bridge Web UI running on a phone" width="360">](docs/assets/codex-bridge-mobile.jpg)
 
-[Project site](https://gh.bhee.online/codex-bridge/) ·
+[This fork](https://github.com/hhaa12321/codex-bridge) ·
+[Upstream](https://github.com/hitsmaxft/codex-bridge) ·
 [Install](docs/install.md) ·
 [`codexctl` reference](docs/codexctl.md) ·
 [Design](DESIGN.md) ·
-[Debugging](DEBUGGING.md)
+[Debugging](DEBUGGING.md) ·
+[MIT License](LICENSE)
+
+> **Community fork:** This repository is maintained by
+> [@hhaa12321](https://github.com/hhaa12321) and is based on
+> [`hitsmaxft/codex-bridge`](https://github.com/hitsmaxft/codex-bridge). It is an independent fork,
+> not an official upstream release. All source in this repository, including changes made here, is
+> available under the [MIT License](LICENSE).
 
 `codex-bridge` connects directly to app-server and its rollout store. It keeps task history, live
 tools and diffs, Queue/Steer/Stop controls, models, and task metadata behind one typed local
 protocol—without using the ChatGPT app as a remote-control relay. Keep the Web UI on loopback, or
 publish it through Cloudflare Access, a VPN, or an authenticated reverse proxy. Model requests
-still use the account and network configured by Codex itself.
+use the API-key provider configured for Codex; no ChatGPT browser login is required. The tested
+Codex CLI/app-server version is pinned to `0.164.0`.
 
 ## What it provides
 
@@ -33,6 +42,8 @@ still use the account and network configured by Codex itself.
 - Editable voice transcription through app-server, with an optional managed local whisper.cpp
   fallback for private Mac, Linux, homelab, and NAS deployments.
 - Bounded caches and authenticated file preview and downloads for long-running hosts.
+- Installable phone-first PWA with a static offline fallback; sessions, credentials, API responses,
+  and app content are never cached.
 
 ## Release highlights
 
@@ -47,13 +58,11 @@ See the [latest release notes](docs/releases/v0.3.14.md) or the
 
 ## Web UI
 
-[Try the interactive demo](https://gh.bhee.online/codex-bridge/demo/). It runs the production Vite
-frontend against a live Rust/WASM simulator entirely in the browser. Submit different prompts to
-see template-driven progress and structured tools, steer or queue another message while it runs,
-withdraw queued work, cancel the run, or try simulated voice-to-text. Demo submissions and images
-never contact Codex or leave the page.
-
-[<img src="docs/assets/codex-bridge-mobile.jpg" alt="Codex App Server WebUI showing a live Codex task on mobile" width="360">](docs/assets/codex-bridge-mobile.jpg)
+[Try the upstream interactive demo](https://gh.bhee.online/codex-bridge/demo/). It runs the
+production Vite frontend against a Rust/WASM simulator entirely in the browser. Submit different
+prompts to see template-driven progress and structured tools, steer or queue another message while
+it runs, withdraw queued work, cancel the run, or try simulated voice-to-text. Demo submissions and
+images never contact Codex or leave the page.
 
 The private UI is responsive across mobile and desktop. It includes project and task navigation,
 rendered tool calls and diffs, task pinning, renaming, and archiving, model selection, Git change summaries,
@@ -71,27 +80,34 @@ expires after five minutes and tolerates browser or proxy retries. Tickets live 
 process memory and become invalid after a restart, so downloads do not expose a long-lived
 anonymous file endpoint or depend on Basic Auth being forwarded by a navigation.
 
+The Web UI is deliberately not terminal-first. Projects and recent sessions lead into a chat
+workspace; execution, approval, clarification, reconnect, and writer-conflict states stay close to
+the conversation. Queue remains available when another app-server owns the writer, while direct
+writes and explicit lock acquisition stay disabled until ownership is available.
+
 ## How it connects
 
-There are two supported deployment shapes. **Use standalone mode by default**, including on macOS.
-It keeps Bridge on an independently installed Codex CLI/app-server and avoids coupling the service
-to a changing App bundle, Desktop launch environment, and private bundled runtime. Desktop
-interposition remains an advanced opt-in compatibility mode.
+There are two supported app-server sources. **Use standalone mode by default**, including on
+macOS. It keeps Bridge on an independently installed Codex CLI/app-server and avoids coupling the
+service to a changing App bundle and private bundled runtime. On Linux the default installer also
+starts `ws-unix-bridge`; Desktop and Web then use that same standalone app-server.
 
 ### Standalone Codex (recommended)
 
 ```text
-standalone codex app-server ── Unix WebSocket ── codex-bridge daemon ── Web UI / codexctl
+Codex Desktop ── ws-unix-bridge ─┐
+                                  ├── one standalone app-server ── Unix WebSocket ── codex-bridge
+Web UI / codexctl ────────────────┘
                                                         │
                                                    rollout store
 ```
 
-Bridge supervises the standalone app-server on its Unix socket. Codex Desktop may remain installed
-and independent. If Desktop or another app-server already owns a session writer, the Web UI opens
-that session read-only and marks it as in use. Queueing remains available in this state and does not
-acquire the writer; direct send, steer, interrupt, and session mutations remain disabled. For a
-writer owned by Bridge, use **Tools → Release session lock** before opening the same session in
-Desktop.
+Bridge supervises the standalone app-server on its Unix socket. The Linux installer creates a
+**Codex Bridge Desktop** launcher that points the Desktop client at `ws-unix-bridge`; fully quit the
+ordinary Desktop process before switching. With that launcher, Desktop and Web share one project and
+session list, receive the same live events, and can both send messages, steer, interrupt, or approve
+work. Do not launch a second private stdio app-server for the same `CODEX_HOME`: that creates a real
+cross-process writer conflict and the Web UI correctly becomes read-only.
 
 ### Codex Desktop interposition on macOS (advanced)
 
@@ -128,6 +144,10 @@ flowchart LR
     Bridge --> Rollouts[(Repositories + rollout history)]
 ```
 
+Use a Cloudflare Named Tunnel, not a Quick Tunnel. The complete Access policy, dual-auth,
+WebSocket, validation, and rollback procedure is in
+[`docs/cloudflare-access.zh-CN.md`](docs/cloudflare-access.zh-CN.md).
+
 The user-level installers build the embedded frontend, install the required Cargo binaries, write
 `~/.config/codex-bridge/config.toml`, and start the appropriate user services without `sudo`:
 
@@ -161,10 +181,14 @@ The optional Web UI listens on `127.0.0.1:18791` by default and normally require
 password file. The sign-in page supports password-manager autofill and creates a seven-day
 HttpOnly session cookie whose private token survives ordinary bridge restarts. A same-host
 HTTPS Web UI also supports passkey sign-in; add and remove passkeys in Settings using the current
-password. Password sign-in remains available.
-An authenticated reverse proxy may use
-`--web-ui-no-auth`; that mode is rejected unless the listener is bound to a loopback address. See
-the installation guide before binding another interface or placing it behind an HTTPS proxy.
+password. Password sign-in remains available. An authenticated proxy may use
+`--web-ui-no-auth` only for a trusted loopback deployment; configuring `public_origins` together
+with `no_auth = true` is rejected so a public proxy cannot become the only authentication layer.
+
+For managed startup, configure `OPENAI_API_KEY`, `api_key_file`, or an API-key provider in the
+active Codex config. Settings → Connection & diagnostics shows only the source category and whether
+the Base URL is configured, plus Bridge, CLI, app-server, schema, active-turn, public-origin, and
+writer state. It never returns the credential value.
 
 ## Components
 
@@ -186,8 +210,11 @@ or `CODEX_BRIDGE_SOCKET`. It creates its default directory as `0700` and socket 
 
 ```sh
 npm --prefix web-ui ci
+CARGO_INCREMENTAL=0 cargo build --release --target wasm32-unknown-unknown \
+  -p codex-bridge-demo
+npm --prefix web-ui run test:demo-wasm
 npm --prefix web-ui run build
-CARGO_INCREMENTAL=0 cargo test --workspace
+CARGO_INCREMENTAL=0 cargo test --workspace --no-fail-fast
 ```
 
 The frontend production bundle is checked in under `web-ui/dist` and embedded with `include_str!`.
@@ -198,3 +225,24 @@ The Web UI and CLI share typed bridge requests. Rollout files provide durable re
 operations use the selected app-server endpoint. Commands never choose a write target by file
 modification time. See [`docs/codexctl.md`](docs/codexctl.md) for command semantics and current
 implementation limits.
+
+## Contributing
+
+Issues and pull requests are welcome in this fork. Keep changes focused, preserve unrelated work,
+and include the validation you ran. Before sending a change, run the relevant frontend tests,
+production build, Rust tests, formatting checks, and dependency checks described in this README
+and `AGENTS.md`.
+
+## Security
+
+Do not put API keys, password files, session cookies, private repository paths, or production logs
+in issues, pull requests, screenshots, or test fixtures. Keep the Web UI on loopback or behind an
+authenticated private-access layer. Report vulnerabilities through this repository's private
+vulnerability reporting or contact the fork maintainer through GitHub instead of opening a public
+issue containing exploit details or credentials.
+
+## License
+
+This fork is distributed under the [MIT License](LICENSE). The original copyright notice and the
+permission notice are retained, and modifications published here are made available under the same
+license.

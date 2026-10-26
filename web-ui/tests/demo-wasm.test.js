@@ -663,7 +663,7 @@ test("worktree creation uses a background handle and mobile completion has a toa
   assert.match(source, /state\.threadCreationJobs\.set/);
   assert.match(source, /deferredCompletionToast/);
   assert.match(api, /kind === "completion" \? 5200 : 2600/);
-  assert.match(stylesheet, /\.composer-status:not\(\[hidden\]\)::before[\s\S]*radial-gradient/);
+  assert.doesNotMatch(stylesheet, /\.composer-status:not\(\[hidden\]\)::before/);
   assert.match(stylesheet, /\.toast\[data-kind="completion"\]/);
 });
 
@@ -726,10 +726,23 @@ test("recent session view uses the newest 50 sessions and keeps project view sep
   assert.match(source, /\$\("reloadBtn"\)\.onclick = \(\) => window\.location\.reload\(\)/);
 });
 
+test("custom providers do not render an unsupported weekly usage error", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /const weeklySupported = Boolean\(r\.weekly_usage_supported\)/);
+  assert.match(source, /state\.usageUnavailable = weeklySupported && !weekly/);
+  assert.match(source, /health\.hidden = !weeklySupported \|\| Boolean\(weekly\)/);
+  assert.match(
+    source,
+    /health\.title = weeklySupported \? r\.weekly_usage_error\?\.message \|\| "" : ""/,
+  );
+});
+
 test("compiled demo WASM supports refresh and active-run interruption", async () => {
   const command = await demoClient();
   const status = result(command({ command: "status" }));
   assert.equal(status.demo, true);
+  const composer = result(command({ command: "composer_status", thread_id: "demo-thread-web-ui" }));
+  assert.equal(composer.weekly_usage_supported, true);
   const windows = result(command({ command: "token_usage_windows" }));
   assert.ok(windows.thirty_days.total_tokens > windows.seven_days.total_tokens);
   const weeklyHistory = result(command({ command: "weekly_usage_history" }));
@@ -997,6 +1010,10 @@ test("startup loads a routed session independently from project and pin discover
   assert.ok(initialFlow.indexOf("sessionRequest") < initialFlow.indexOf("await projectsRequest"));
   assert.doesNotMatch(projectsFlow, /Promise\.all\(\[[\s\S]*loadPins\(\)/);
   assert.match(projectsFlow, /void loadPins\(\)\.then/);
+  assert.match(
+    source,
+    /state\.current = \{ \.\.\.thread, \.\.\.r\.thread \};\s+\$\("threadTitle"\)\.textContent = state\.current\.title/,
+  );
 });
 
 test("an empty hash restores the last opened session", () => {
@@ -1026,7 +1043,7 @@ test("expanded project folders persist as a bounded browser preference", () => {
 
 test("file diffs define distinct light and dark theme palettes", async () => {
   const stylesheet = await readFile(stylesheetPath, "utf8");
-  assert.match(stylesheet, /:root\s*\{[^}]*--diff-surface:\s*#191c19/s);
+  assert.match(stylesheet, /:root\s*\{[^}]*--diff-surface:\s*#181b1f/s);
   assert.match(stylesheet, /html\[data-theme="light"\]\s*\{[^}]*--diff-surface:\s*#fff/s);
   assert.match(stylesheet, /\.diff-line\.add\s*\{[^}]*var\(--diff-add-bg\)/s);
   assert.match(stylesheet, /\.diff-line\.delete\s*\{[^}]*var\(--diff-delete-bg\)/s);
@@ -1122,25 +1139,28 @@ test("mobile composer stays out of the message grid and catches its own pointer 
   const index = await readFile(indexPath, "utf8");
   const stylesheet = await readFile(stylesheetPath, "utf8");
   const source = await readFile(mainScriptPath, "utf8");
-  const mobile = stylesheet.slice(stylesheet.indexOf("@media (max-width: 800px)"));
+  const mobile = stylesheet.slice(stylesheet.lastIndexOf("@media (max-width: 800px)"));
   assert.match(index, /interactive-widget=resizes-content/);
   assert.match(mobile, /\.composer\s*\{[^}]*position:\s*fixed;/s);
   assert.doesNotMatch(mobile, /#messages\s*\{[^}]*grid-row:\s*2;/s);
   assert.doesNotMatch(mobile, /\.composer\s*\{[^}]*grid-row:\s*2;/s);
   assert.doesNotMatch(source, /textarea\.blur\(\)/);
   assert.match(source, /syncOutboxCompactLabel/);
-  assert.doesNotMatch(mobile, /\.composer-shell[^\{]*\{[^}]*grid-template-areas:/s);
   assert.match(
     mobile,
-    /\.composer-shell\s*\{[^}]*grid-template-columns:\s*106px 72px minmax\(0, 1fr\) 64px;/s,
+    /\.composer-shell\s*\{[^}]*grid-template-areas:\s*"mode input attach submit";/s,
   );
-  assert.match(mobile, /\.composer-shell #submitBtn\s*\{[^}]*width:\s*64px;/s);
+  assert.match(
+    mobile,
+    /\.composer-shell\s*\{[^}]*grid-template-columns:\s*62px minmax\(0, 1fr\) 44px 44px;/s,
+  );
+  assert.match(mobile, /\.composer-shell #submitBtn,[\s\S]*?width:\s*44px;/s);
   assert.match(mobile, /\.composer\s*\{[^}]*pointer-events:\s*auto;/s);
   assert.match(mobile, /\.composer-shell\s*\{[^}]*pointer-events:\s*auto;/s);
   assert.match(mobile, /\.composer-shell textarea,[\s\S]*?touch-action:\s*manipulation;/s);
   assert.match(
     mobile,
-    /\.composer-shell textarea\s*\{[^}]*-webkit-appearance:\s*none;[^}]*min-height:\s*56px;[^}]*padding:\s*18px 7px;[^}]*font-family:\s*-apple-system,[^}]*font-size:\s*16px;[^}]*line-height:\s*20px;[^}]*zoom:\s*1;/s,
+    /\.composer-shell textarea\s*\{[^}]*min-height:\s*44px;[^}]*padding:\s*10px 3px;[^}]*font-size:\s*16px;[^}]*line-height:\s*20px;/s,
   );
   assert.match(
     mobile,
@@ -1200,7 +1220,10 @@ test("browser performance samples use the bounded demo protocol", async () => {
   );
   assert.equal(response.recorded, true);
   const api = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
-  assert.match(api, /performanceBuckets\.set\(metric, bucket\);\s*schedulePerformanceFlush\(\)/);
+  assert.match(
+    api,
+    /performanceBuckets\.set\(metric, bucket\);[\s\S]*?schedulePerformanceFlush\(\)/,
+  );
   assert.doesNotMatch(api, /setInterval\(\(\) => flushPerformance\(\)/);
 });
 
@@ -1266,8 +1289,8 @@ test("steer messages use a distinct bean-green outbox palette", async () => {
   const stylesheet = await readFile(stylesheetPath, "utf8");
   const source = await readFile(mainScriptPath, "utf8");
   assert.match(source, /entry\.action === "steer" \? " steer" : ""/);
-  assert.match(stylesheet, /--steer-bg:\s*#263d2d/);
-  assert.match(stylesheet, /html\[data-theme="light"\][\s\S]*--steer-bg:\s*#deeddd/);
+  assert.match(stylesheet, /--steer-bg:\s*#1e342d/);
+  assert.match(stylesheet, /html\[data-theme="light"\][\s\S]*--steer-bg:\s*#e3f1e5/);
   assert.match(stylesheet, /\.outbox-item\.steer \.message-body\s*\{[^}]*var\(--steer-bg\)/s);
 });
 
@@ -2449,11 +2472,11 @@ test("session return renders the latest batch before any older history", async (
   assert.match(openFlow, /fetchMessages\(null, state\.initialPageSize\)/);
   assert.match(openFlow, /await yieldToBrowser\(\)/);
   assert.match(openFlow, /const messagesRequest = fetchMessages/);
-  assert.match(openFlow, /command\(\{ command: "thread_watch"/);
+  assert.match(openFlow, /refreshCurrentThreadWriter\(\)/);
   assert.match(openFlow, /command\(\{ command: "pending_messages"/);
   assert.match(openFlow, /r = await messagesRequest/);
   assert.ok(
-    openFlow.indexOf('command({ command: "thread_watch"') <
+    openFlow.indexOf("refreshCurrentThreadWriter()") <
       openFlow.indexOf("r = await messagesRequest"),
   );
   assert.match(stateSource, /initialPageSize: 8,[\s\S]*pageSize: 30/);
@@ -3285,7 +3308,7 @@ test("a lost Steer response reconciles server acceptance without trapping the co
   const source = await readFile(mainScriptPath, "utf8");
   const writeSource = source.slice(
     source.indexOf("async function write(name) {"),
-    source.indexOf("function approval(name) {"),
+    source.indexOf('$("search").oninput = renderProjects;'),
   );
   const message = { value: "Check the mounting slope" };
   const state = {
@@ -3338,7 +3361,7 @@ test("a stale writer lock cannot silently turn an explicit Steer into Queue", as
   const source = await readFile(mainScriptPath, "utf8");
   const writeSource = source.slice(
     source.indexOf("async function write(name) {"),
-    source.indexOf("function approval(name) {"),
+    source.indexOf('$("search").oninput = renderProjects;'),
   );
   const message = { value: "Check the mounting slope" };
   const state = {
@@ -3426,6 +3449,7 @@ test("stale writer status keeps Steer selection and submit controls available", 
     syncVoiceCapability: () => {},
     syncComposerPlaceholder: () => {},
     renderAsyncQuestion: () => {},
+    diagnostics: { record: () => {} },
   };
   runInNewContext(
     `${lockSource}\n${submitSource}\napplyThreadWriterLock({state: "checking", read_only: true})`,
@@ -3437,9 +3461,139 @@ test("stale writer status keeps Steer selection and submit controls available", 
   state.activeTurnId = null;
   context.applyThreadWriterLock({ state: "unavailable", read_only: true });
   assert.equal(element("relocateThreadBtn").disabled, false);
+  assert.equal(element("writerLockBtn").hidden, false);
+  assert.equal(element("writerLockBtn").textContent, "retrySessionLock");
+  assert.equal(element("writerLockNotice").hidden, true);
+  assert.match(source, /classList\.toggle\("read-only", blocked && !draft\)/);
+  assert.match(source, /sessionLockUnavailable/);
   state.current = null;
   context.applyThreadWriterLock({ state: "unavailable", read_only: true });
   assert.equal(element("relocateThreadBtn").disabled, true);
+});
+
+test("mobile layout prioritizes content density in both themes", async () => {
+  const [index, source, stylesheet] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  const mobile = stylesheet.slice(stylesheet.lastIndexOf("@media (max-width: 800px) {"));
+
+  assert.match(index, /id="themeQuickToggle"/);
+  assert.match(source, /applyTheme\(storedTheme\(\), false\)/);
+  assert.match(stylesheet, /:root \{[\s\S]*?--bg: #101214;/);
+  assert.match(stylesheet, /html\[data-theme="light"\] \{[\s\S]*?--bg: #f8f9fa;/);
+  assert.match(mobile, /#sidebar \{[\s\S]*?width: min\(100vw, 460px\);/);
+  assert.match(mobile, /\.thread \{[\s\S]*?height: 56px;/);
+  assert.match(mobile, /\.thread-meta \{[\s\S]*?display: block;/);
+  assert.match(mobile, /\.message-body \{[\s\S]*?font-size: 15px;/);
+  assert.match(
+    mobile,
+    /#messages \{[\s\S]*?padding: 8px max\(12px, env\(safe-area-inset-right\)\)/,
+  );
+  assert.match(mobile, /\.thread-head \.goal-restore \{[\s\S]*?position: static;/);
+  assert.match(mobile, /\.message-tail-status \{[\s\S]*?position: fixed;/);
+  assert.match(mobile, /\.turn-group:not\(\.expanded\) \.turn-fold-usage,[\s\S]*?display: none;/);
+  assert.match(mobile, /\.composer-status:not\(\[hidden\]\) \{[\s\S]*?display: flex;/);
+  assert.match(mobile, /#usageState \{[\s\S]*?display: none;/);
+  assert.match(
+    mobile,
+    /\.composer-shell \{[\s\S]*?grid-template-columns: 62px minmax\(0, 1fr\) 44px 44px;/,
+  );
+  assert.match(mobile, /\.composer-shell textarea \{[\s\S]*?min-height: 44px;/);
+  assert.match(mobile, /\.message\.user \{[\s\S]*?border-radius: 8px;/);
+  assert.match(mobile, /\.tool-group-summarize \{[\s\S]*?width: 44px;/);
+});
+
+test("reconnect messaging waits briefly and can be cancelled by recovery", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const syncSource = source.slice(
+    source.indexOf("let messageSyncReconnectTimer = null;"),
+    source.indexOf("function captureMessageElementPosition("),
+  );
+  const timers = new Map();
+  let nextTimer = 0;
+  const state = { messageSyncPhase: null, eventStreamConnected: false };
+  const context = {
+    state,
+    window: {
+      setTimeout: (callback, delay) => {
+        const id = ++nextTimer;
+        timers.set(id, { callback, delay });
+        return id;
+      },
+      clearTimeout: (id) => timers.delete(id),
+    },
+    diagnostics: { record: () => {} },
+    renderMessageTailStatus: () => {},
+  };
+  context.setMessageSyncPhase = runInNewContext(`${syncSource}\nsetMessageSyncPhase`, context);
+  context.setMessageSyncPhase("reconnecting");
+  assert.equal(state.messageSyncPhase, null);
+  assert.equal([...timers.values()][0].delay, 1_500);
+  [...timers.values()][0].callback();
+  assert.equal(state.messageSyncPhase, "reconnecting");
+
+  state.messageSyncPhase = null;
+  context.setMessageSyncPhase("reconnecting");
+  state.eventStreamConnected = true;
+  [...timers.values()][0].callback();
+  assert.equal(state.messageSyncPhase, null);
+});
+
+test("diagnostics UI exposes bounded browser events without message content", async () => {
+  const [index, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.match(index, /id="clientDiagnosticsLog"/);
+  assert.match(index, /id="diagnosticsExportBtn"/);
+  assert.match(source, /function renderClientDiagnostics\(\)/);
+  assert.match(source, /events: diagnostics\.recent\(\)/);
+  assert.match(source, /write_state|writer_state/);
+  assert.match(source, /clientDiagnosticSummary/);
+  assert.doesNotMatch(source, /diagnostics\.record\("command_start".*text/);
+});
+
+test("writer status refreshes after recovery and stream reconnect", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const refreshSource = source.slice(
+    source.indexOf("async function refreshCurrentThreadWriter() {"),
+    source.indexOf("function applyThreadWriterLock(lock) {"),
+  );
+  const locks = [];
+  const liveStatuses = [];
+  const state = { current: { id: "manta" }, threadWriterLock: { state: "unavailable" } };
+  let commandImpl = async () => ({
+    writer_lock: { state: "owned", read_only: false, reason: null },
+    thread: { status: { type: "active" } },
+  });
+  const context = {
+    state,
+    command: (request) => commandImpl(request),
+    updateThreadLiveFromStatus: (threadId, status) => liveStatuses.push({ threadId, status }),
+    applyThreadWriterLock: (lock) => {
+      state.threadWriterLock = lock;
+      locks.push(lock.state);
+    },
+    refreshEditableInterruptedTurn: () => {},
+  };
+  const refresh = runInNewContext(
+    `let threadWriterRefreshGeneration = 0;\n${refreshSource}\nrefreshCurrentThreadWriter`,
+    context,
+  );
+
+  await refresh();
+  assert.deepEqual(locks, ["owned"]);
+  assert.equal(liveStatuses[0].threadId, "manta");
+
+  commandImpl = async () => {
+    throw new Error("temporary app-server failure");
+  };
+  await assert.rejects(refresh(), /temporary app-server failure/);
+  assert.equal(locks.at(-1), "unavailable");
+  assert.match(source, /state\.eventStreamConnected\) \{[\s\S]*refreshCurrentThreadWriter\(\)/);
+  assert.match(source, /event\.status === "connected"\) \{[\s\S]*refreshCurrentThreadWriter\(\)/);
 });
 
 test("a command timeout also covers a stalled response body", async () => {
@@ -3453,6 +3607,9 @@ test("a command timeout also covers a stalled response body", async () => {
     demoMode: false,
     monitoredJson: (response) => response.json(),
     AbortController,
+    crypto: { randomUUID: () => "request-id-1234" },
+    performance: { now: () => 0 },
+    diagnostics: { record: () => {} },
     window: {
       setTimeout: (callback) => setTimeout(callback, 0),
       clearTimeout,
@@ -3473,6 +3630,10 @@ test("a command timeout also covers a stalled response body", async () => {
 
 test("a slow history page does not delay writer or queue state", async () => {
   const source = await readFile(mainScriptPath, "utf8");
+  const writerRefreshSource = source.slice(
+    source.indexOf("async function refreshCurrentThreadWriter() {"),
+    source.indexOf("function applyThreadWriterLock(lock) {"),
+  );
   const openSource = source.slice(
     source.indexOf("async function openThread("),
     source.indexOf("async function refreshThread() {"),
@@ -3493,6 +3654,7 @@ test("a slow history page does not delay writer or queue state", async () => {
     renderAsyncQuestion: () => {},
     scheduleActivityFallback: () => {},
     applyThreadWriterLock: (lock) => locks.push(lock.state),
+    updateThreadLiveFromStatus: () => {},
     syncTemporaryForCurrent: () => {},
     resetThreadViewState: () => {},
     setTimeout: () => 0,
@@ -3520,7 +3682,7 @@ test("a slow history page does not delay writer or queue state", async () => {
     renderGoalPanel: () => {},
   };
   runInNewContext(
-    `let pendingSnapshotGeneration = 0, pendingAppliedGeneration = 0;\n${openSource}\nopenThread({id: "manta", title: "Manta58", cwd: "/tmp"}, {quiet: true})`,
+    `let pendingSnapshotGeneration = 0, pendingAppliedGeneration = 0, threadWriterRefreshGeneration = 0;\n${writerRefreshSource}\n${openSource}\nopenThread({id: "manta", title: "Manta58", cwd: "/tmp"}, {quiet: true})`,
     context,
   );
   await new Promise((resolve) => setImmediate(resolve));

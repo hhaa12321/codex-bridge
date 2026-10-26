@@ -59,7 +59,13 @@ function fixedAssetCacheBuster() {
           const version = createHash("sha256").update(content).digest("hex").slice(0, 12);
           html = html.replace(`/${fileName}`, `/${fileName}?v=${version}`);
         }
-        for (const fileName of ["favicon.ico", "app-icon.png"]) {
+        for (const fileName of [
+          "favicon.ico",
+          "app-icon.png",
+          "app-icon-192.png",
+          "app-icon-maskable-512.png",
+          "manifest.webmanifest",
+        ]) {
           const content = await readFile(new URL(`./public/${fileName}`, import.meta.url));
           const version = createHash("sha256").update(content).digest("hex").slice(0, 12);
           html = html.replaceAll(`/${fileName}`, `/${fileName}?v=${version}`);

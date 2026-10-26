@@ -29,7 +29,8 @@ use codex_bridge::{
     CodexCliBackend, ComposerAttachment, HostExecFailure, HostExecutor, Request, Response,
     RolloutOrdinalRepair, SessionStore, ThreadMessage, ThreadProjectIndex, ThreadSummary,
     ThreadToolCall, ThreadWriterState, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV,
-    CHATS_PROJECT_PATH, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
+    CHATS_PROJECT_PATH, CODEX_BIN_ENV, CODEX_HOME_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION,
+    SOCKET_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
@@ -60,10 +61,15 @@ const PROJECT_INDEX_TTL: Duration = Duration::from_secs(10);
 const APP_SERVER_ADOPTION_STABILITY_WINDOW: Duration = Duration::from_secs(2);
 const APP_SERVER_ADOPTION_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_DOWNLOAD_TICKETS: usize = 128;
+const MAX_CLIENT_DIAGNOSTIC_BYTES: usize = 128 * 1024;
+const MAX_CLIENT_DIAGNOSTIC_EVENTS: usize = 32;
+const MAX_API_KEY_FILE_BYTES: u64 = 64 * 1024;
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
 const WEB_SESSION_COOKIE: &str = "codex_bridge_session";
 const WEB_SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
-const DEFAULT_WEB_UI_NAME: &str = "Codex App Server WebUI";
+const DEFAULT_WEB_UI_NAME: &str = "Codex Bridge";
 const DEFAULT_WS_BRIDGE_ADDR: &str = "127.0.0.1:18790";
 const DEFAULT_WHISPER_ADDR: &str = "127.0.0.1:18792";
 const DESKTOP_CODEX_PATH: &str =
@@ -71,13 +77,23 @@ const DESKTOP_CODEX_PATH: &str =
 const WRAPPER_DESKTOP_CODEX_PATH: &str =
     "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
 const LEGACY_DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
+#[cfg(target_os = "linux")]
+const LINUX_DESKTOP_PROGRAM: &str = "/usr/lib/chatgpt/ChatGPT";
+#[cfg(target_os = "linux")]
+const LINUX_DESKTOP_CODEX_PATH: &str = "/usr/lib/chatgpt/resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_LOGIN: &str = include_str!("../../../web-ui/login.html");
 const WEB_PASSKEY_JS: &str = include_str!("../../../web-ui/public/assets/passkey.js");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
 const WEB_FILE_PREVIEW_JS: &str = include_str!("../../../web-ui/dist/assets/file-preview.js");
+const WEB_MANIFEST: &str = include_str!("../../../web-ui/dist/manifest.webmanifest");
+const WEB_SERVICE_WORKER: &str = include_str!("../../../web-ui/dist/sw.js");
+const WEB_OFFLINE: &str = include_str!("../../../web-ui/dist/offline.html");
 const WEB_APP_ICON: &[u8] = include_bytes!("../../../web-ui/dist/app-icon.png");
+const WEB_APP_ICON_192: &[u8] = include_bytes!("../../../web-ui/dist/app-icon-192.png");
+const WEB_APP_ICON_MASKABLE: &[u8] =
+    include_bytes!("../../../web-ui/dist/app-icon-maskable-512.png");
 const WEB_FAVICON: &[u8] = include_bytes!("../../../web-ui/dist/favicon.ico");
 const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
@@ -86,6 +102,7 @@ const MAX_APP_SERVER_TOOL_PAGES: usize = 8;
 const MAX_ASYNC_QUESTION_PAGES: usize = 8;
 #[cfg(test)]
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WEB_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -203,6 +220,7 @@ struct BridgeFileConfig {
     codex_home: Option<PathBuf>,
     projectless_workspace_root: Option<PathBuf>,
     codex_bin: Option<PathBuf>,
+    api_key_file: Option<PathBuf>,
     app_server_socket: Option<PathBuf>,
     app_server_thread_cache: Option<usize>,
     host_exec_policy: Option<PathBuf>,
@@ -261,6 +279,7 @@ struct RuntimeArgs {
     codex_home: Option<PathBuf>,
     projectless_workspace_root: Option<PathBuf>,
     codex_bin: Option<PathBuf>,
+    api_key_file: Option<PathBuf>,
     app_server_socket: Option<PathBuf>,
     app_server_thread_cache: usize,
     host_exec_policy: Option<PathBuf>,
@@ -307,6 +326,33 @@ struct CodexGuiStatus {
     inspection_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CodexCliCompatibility {
+    pinned_version: String,
+    cli_version: Option<String>,
+    unix_listener_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl CodexCliCompatibility {
+    fn compatible(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ApiKeyStatus {
+    configured: bool,
+    source: String,
+    base_url_configured: bool,
+}
+
+struct ApiKeyRuntime {
+    status: ApiKeyStatus,
+    environment: HashMap<String, String>,
+}
+
 #[derive(Clone)]
 struct BridgeState {
     socket_path: Arc<PathBuf>,
@@ -324,6 +370,9 @@ struct BridgeState {
     weekly_usage_history: Arc<WeeklyUsageHistory>,
     runtime_mode: RuntimeMode,
     config_path: Option<PathBuf>,
+    codex_compatibility: CodexCliCompatibility,
+    api_key_status: ApiKeyStatus,
+    public_origin: Option<String>,
     manage_app_server: bool,
     desktop_interposition: bool,
     ws_bridge_listen: Option<SocketAddr>,
@@ -341,10 +390,17 @@ struct BridgeState {
 const COMPOSER_ACTIVE_REFRESH: Duration = Duration::from_secs(60);
 const COMPOSER_IDLE_REFRESH: Duration = Duration::from_secs(20 * 60);
 
+#[derive(Clone, Default)]
+struct ComposerWeeklyUsage {
+    supported: bool,
+    usage: Option<Value>,
+    error: Option<Value>,
+}
+
 #[derive(Default)]
 struct ComposerCache {
     models: RwLock<Option<Vec<Value>>>,
-    weekly: RwLock<(Option<Value>, Option<Value>)>,
+    weekly: RwLock<ComposerWeeklyUsage>,
     config: RwLock<(Option<String>, Option<String>)>,
     thread_settings: RwLock<HashMap<String, (Option<String>, Option<String>)>>,
     thread_checks: Mutex<HashMap<String, Instant>>,
@@ -408,6 +464,15 @@ fn composer_refresh_interval(active: bool) -> Duration {
     }
 }
 
+fn account_rate_limits_available(account_response: &Value) -> bool {
+    account_response
+        .get("requiresOpenaiAuth")
+        .is_some_and(|required| required == &Value::Bool(true))
+        && account_response
+            .get("account")
+            .is_some_and(|account| !account.is_null())
+}
+
 fn spawn_composer_cache_monitor(state: BridgeState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -456,24 +521,40 @@ fn spawn_composer_cache_monitor(state: BridgeState) -> tokio::task::JoinHandle<(
                         *models = Some(composer_model_options(&result));
                     }
                 }
-                let (usage, error) = match backend.app_server_rpc("account/rateLimits/read", json!({})) {
-                    Ok(result) => match weekly_usage(&result) {
-                        Some(usage) => (Some(usage), None),
-                        None => (None, Some(json!({"code": "weekly_usage_unavailable", "message": "app-server response did not include seven-day usage"}))),
-                    },
-                    Err(error) => (None, Some(json!({"code": error.code, "message": error.message}))),
+                let weekly_supported = match backend.app_server_rpc("account/read", json!({"refreshToken": false})) {
+                    Ok(account) => Some(account_rate_limits_available(&account)),
+                    Err(_) => None,
                 };
-                if let Err(record_error) = history.record(
-                    usage.as_ref().and_then(|usage| usage.get("remaining_percent")).and_then(Value::as_i64),
-                    usage.as_ref().and_then(|usage| usage.get("resets_at")).and_then(Value::as_i64),
-                    error.as_ref().and_then(|error| error.get("code")).and_then(Value::as_str),
-                ) {
-                    eprintln!("[codex-bridge] failed to record weekly usage probe: {record_error:#}");
-                }
-                if let Ok(mut weekly) = cache.weekly.write() {
-                    if usage.is_some() || weekly.0.is_none() {
-                        *weekly = (usage, error);
+                match weekly_supported {
+                    Some(true) => {
+                        let (usage, error) = match backend.app_server_rpc("account/rateLimits/read", json!({})) {
+                            Ok(result) => match weekly_usage(&result) {
+                                Some(usage) => (Some(usage), None),
+                                None => (None, Some(json!({"code": "weekly_usage_unavailable", "message": "app-server response did not include seven-day usage"}))),
+                            },
+                            Err(error) => (None, Some(json!({"code": error.code, "message": error.message}))),
+                        };
+                        if let Err(record_error) = history.record(
+                            usage.as_ref().and_then(|usage| usage.get("remaining_percent")).and_then(Value::as_i64),
+                            usage.as_ref().and_then(|usage| usage.get("resets_at")).and_then(Value::as_i64),
+                            error.as_ref().and_then(|error| error.get("code")).and_then(Value::as_str),
+                        ) {
+                            eprintln!("[codex-bridge] failed to record weekly usage probe: {record_error:#}");
+                        }
+                        if let Ok(mut weekly) = cache.weekly.write() {
+                            weekly.supported = true;
+                            if usage.is_some() || weekly.usage.is_none() {
+                                weekly.usage = usage;
+                                weekly.error = error;
+                            }
+                        }
                     }
+                    Some(false) => {
+                        if let Ok(mut weekly) = cache.weekly.write() {
+                            *weekly = ComposerWeeklyUsage::default();
+                        }
+                    }
+                    None => {}
                 }
             }).await;
         }
@@ -625,6 +706,13 @@ struct WebAuth {
 struct WebLoginForm {
     username: String,
     password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientDiagnosticBatch {
+    #[serde(default)]
+    context: Value,
+    events: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1558,13 +1646,16 @@ fn desktop_codex_program() -> Option<PathBuf> {
 
 fn is_desktop_codex_program(program: &Path) -> bool {
     let resolved = fs::canonicalize(program).ok();
-    [
+    let mut candidates = vec![
         DESKTOP_CODEX_PATH,
         WRAPPER_DESKTOP_CODEX_PATH,
         LEGACY_DESKTOP_CODEX_PATH,
-    ]
-    .into_iter()
-    .any(|path| program == Path::new(path) || resolved.as_deref() == Some(Path::new(path)))
+    ];
+    #[cfg(target_os = "linux")]
+    candidates.push(LINUX_DESKTOP_CODEX_PATH);
+    candidates
+        .into_iter()
+        .any(|path| program == Path::new(path) || resolved.as_deref() == Some(Path::new(path)))
 }
 
 fn app_server_version_from_user_agent(user_agent: &str) -> Option<&str> {
@@ -1578,6 +1669,186 @@ fn app_server_version_from_user_agent(user_agent: &str) -> Option<&str> {
                     .is_some_and(|character| character.is_ascii_digit())
                 && part.chars().any(|character| character == '.')
         })
+}
+
+fn inspect_codex_cli(program: &Path) -> CodexCliCompatibility {
+    let mut compatibility = CodexCliCompatibility {
+        pinned_version: APP_SERVER_SCHEMA_VERSION.to_owned(),
+        cli_version: None,
+        unix_listener_supported: false,
+        error: None,
+    };
+    let version = match Command::new(program)
+        .arg("--version")
+        .env("LC_ALL", "C")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        Ok(output) => {
+            compatibility.error = Some(format!(
+                "Codex CLI version check exited with {}; set codex_bin to the supported executable",
+                output.status
+            ));
+            return compatibility;
+        }
+        Err(error) => {
+            compatibility.error = Some(format!(
+                "Codex CLI is unavailable at {}: {error}; install it or set codex_bin",
+                program.display()
+            ));
+            return compatibility;
+        }
+    };
+    compatibility.cli_version = app_server_version_from_user_agent(&version).map(str::to_owned);
+    if compatibility.cli_version.as_deref() != Some(APP_SERVER_SCHEMA_VERSION) {
+        compatibility.error = Some(format!(
+            "Codex CLI {} does not match the tested app-server schema {}; install the pinned CLI or update and revalidate the Bridge schema",
+            compatibility.cli_version.as_deref().unwrap_or("unknown"),
+            APP_SERVER_SCHEMA_VERSION
+        ));
+        return compatibility;
+    }
+
+    let help = match Command::new(program)
+        .args(["app-server", "--help"])
+        .env("LC_ALL", "C")
+        .output()
+    {
+        Ok(output) if output.status.success() => format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Ok(output) => {
+            compatibility.error = Some(format!(
+                "Codex CLI app-server help exited with {}; reinstall the pinned CLI",
+                output.status
+            ));
+            return compatibility;
+        }
+        Err(error) => {
+            compatibility.error = Some(format!(
+                "failed to inspect app-server capabilities: {error}"
+            ));
+            return compatibility;
+        }
+    };
+    compatibility.unix_listener_supported = help.contains("--listen") && help.contains("unix://");
+    if !compatibility.unix_listener_supported {
+        compatibility.error = Some(
+            "Codex app-server does not advertise Unix WebSocket listeners (--listen unix://)"
+                .to_owned(),
+        );
+    }
+    compatibility
+}
+
+fn codex_provider_api_key_status(codex_home: &Path) -> Result<(bool, bool)> {
+    let path = codex_home.join("config.toml");
+    let encoded = match fs::read_to_string(&path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok((false, false)),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if encoded.len() > 1024 * 1024 {
+        bail!("Codex config.toml is unexpectedly large");
+    }
+    let config: toml::Value =
+        toml::from_str(&encoded).with_context(|| format!("failed to parse {}", path.display()))?;
+    let provider_name = config
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("openai");
+    let provider = config
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get(provider_name))
+        .and_then(toml::Value::as_table);
+    let base_url_configured = provider
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|base_url| !base_url.trim().is_empty())
+        || env::var_os(OPENAI_BASE_URL_ENV).is_some_and(|value| !value.is_empty());
+    let direct_key = provider.is_some_and(|provider| {
+        ["experimental_bearer_token", "api_key", "token"]
+            .into_iter()
+            .filter_map(|field| provider.get(field))
+            .filter_map(toml::Value::as_str)
+            .any(|token| !token.trim().is_empty())
+    });
+    let environment_key = provider
+        .and_then(|provider| provider.get("env_key"))
+        .and_then(toml::Value::as_str)
+        .and_then(|name| env::var_os(name))
+        .is_some_and(|value| !value.is_empty());
+    Ok((direct_key || environment_key, base_url_configured))
+}
+
+fn read_private_api_key(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect API key file {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("API key path must be a regular file: {}", path.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("API key file must be owned by the current user");
+    }
+    if metadata.mode() & 0o077 != 0 {
+        bail!("API key file must not be accessible by group or other users");
+    }
+    if metadata.len() > MAX_API_KEY_FILE_BYTES {
+        bail!("API key file is unexpectedly large");
+    }
+    let key = fs::read_to_string(path)
+        .with_context(|| format!("failed to read API key file {}", path.display()))?
+        .trim()
+        .to_owned();
+    if key.is_empty() || key.chars().any(char::is_control) {
+        bail!("API key file must contain one non-empty key value");
+    }
+    Ok(key)
+}
+
+fn inspect_api_key(api_key_file: Option<&Path>, codex_home: &Path) -> Result<ApiKeyRuntime> {
+    let (codex_config_configured, base_url_configured) = codex_provider_api_key_status(codex_home)?;
+    if env::var_os(OPENAI_API_KEY_ENV).is_some_and(|value| !value.is_empty()) {
+        return Ok(ApiKeyRuntime {
+            status: ApiKeyStatus {
+                configured: true,
+                source: "environment".to_owned(),
+                base_url_configured,
+            },
+            environment: HashMap::new(),
+        });
+    }
+    if let Some(path) = api_key_file {
+        let key = read_private_api_key(path)?;
+        return Ok(ApiKeyRuntime {
+            status: ApiKeyStatus {
+                configured: true,
+                source: "file".to_owned(),
+                base_url_configured,
+            },
+            environment: HashMap::from([(OPENAI_API_KEY_ENV.to_owned(), key)]),
+        });
+    }
+    Ok(ApiKeyRuntime {
+        status: ApiKeyStatus {
+            configured: codex_config_configured,
+            source: if codex_config_configured {
+                "codex_config"
+            } else {
+                "missing"
+            }
+            .to_owned(),
+            base_url_configured,
+        },
+        environment: HashMap::new(),
+    })
 }
 
 fn parse_thread_cache_limit(value: &str) -> std::result::Result<usize, String> {
@@ -1737,12 +2008,17 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         .or(config.codex_bin)
         .map(expand_home_path)
         .or_else(|| match mode {
-            RuntimeMode::Desktop => {
-                desktop_codex_program().or_else(|| Some(PathBuf::from(DESKTOP_CODEX_PATH)))
-            }
+            RuntimeMode::Desktop => desktop_codex_program().or_else(|| {
+                #[cfg(target_os = "linux")]
+                if Path::new(LINUX_DESKTOP_CODEX_PATH).is_file() {
+                    return Some(PathBuf::from(LINUX_DESKTOP_CODEX_PATH));
+                }
+                Some(PathBuf::from(DESKTOP_CODEX_PATH))
+            }),
             RuntimeMode::Standalone => Some(PathBuf::from("codex")),
             RuntimeMode::Auto => None,
         });
+    let api_key_file = config.api_key_file.map(expand_home_path);
     let app_server_socket = args
         .app_server_socket
         .or_else(|| {
@@ -1782,12 +2058,33 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         resolve_visible_directories(config.web_ui.visible_directories.unwrap_or_default())?;
     let manage_app_server = config.services.manage_app_server.unwrap_or(false);
     let desktop_interposition = config.services.desktop_interposition.unwrap_or(false);
-    if desktop_interposition && !matches!(mode, RuntimeMode::Desktop) {
-        bail!("services.desktop_interposition requires mode = \"desktop\"");
-    }
     if manage_app_server && app_server_socket.is_none() {
         bail!(
             "services.manage_app_server requires an app-server socket or a concrete runtime mode"
+        );
+    }
+    if desktop_interposition && app_server_socket.is_none() {
+        bail!("services.desktop_interposition requires an app-server Unix socket");
+    }
+    let no_auth = if args.web_ui_no_auth {
+        true
+    } else if args.web_ui_auth {
+        false
+    } else {
+        config.web_ui.no_auth.unwrap_or(false)
+    };
+    if no_auth && !web_ui_public_origin.is_empty() {
+        bail!(
+            "web_ui.no_auth must remain false when public_origins configures a public reverse proxy"
+        );
+    }
+    let app_server_environment = config.services.app_server_environment.unwrap_or_default();
+    if app_server_environment
+        .get(OPENAI_API_KEY_ENV)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        bail!(
+            "{OPENAI_API_KEY_ENV} must not be written in config.toml; use the process environment or api_key_file"
         );
     }
     let whisper = if config.services.whisper.enabled.unwrap_or(false) {
@@ -1863,6 +2160,7 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         codex_home,
         projectless_workspace_root,
         codex_bin,
+        api_key_file,
         app_server_socket,
         app_server_thread_cache,
         host_exec_policy,
@@ -1892,13 +2190,7 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
             .map(expand_home_path),
         web_ui_tls_cert_file,
         web_ui_tls_private_key_file,
-        web_ui_no_auth: if args.web_ui_no_auth {
-            true
-        } else if args.web_ui_auth {
-            false
-        } else {
-            config.web_ui.no_auth.unwrap_or(false)
-        },
+        web_ui_no_auth: no_auth,
         web_ui_public_origin,
         web_ui_visible_directories,
         manage_app_server,
@@ -1909,12 +2201,11 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
                 .expect("valid WS bridge address")
         }),
         ws_bridge_bin: config.services.ws_bridge_bin.map(expand_home_path),
-        app_server_environment: config.services.app_server_environment.unwrap_or_default(),
+        app_server_environment,
         whisper,
     })
 }
 
-#[derive(Debug)]
 struct ManagedProcessSpec {
     name: &'static str,
     program: PathBuf,
@@ -2076,7 +2367,47 @@ fn launchctl_environment_value(name: &str) -> Result<Option<String>> {
     Ok((!value.trim().is_empty()).then(|| value.trim().to_owned()))
 }
 
-fn inspect_codex_gui(expected_ws_url: Option<&str>) -> CodexGuiStatus {
+#[cfg(target_os = "linux")]
+fn systemctl_user_environment(name: &str) -> Result<Option<String>> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .env("LC_ALL", "C")
+        .output()
+        .context("failed to inspect systemd user environment")?;
+    if !output.status.success() {
+        bail!(
+            "systemctl --user show-environment exited with {}",
+            output.status
+        );
+    }
+    let environment =
+        String::from_utf8(output.stdout).context("systemd user environment is not UTF-8")?;
+    Ok(environment.lines().find_map(|line| {
+        line.strip_prefix(name)
+            .and_then(|value| value.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_gui_running(ps_output: &str, program: &Path) -> bool {
+    let program = program.to_string_lossy();
+    ps_output.lines().any(|line| {
+        let line = line.trim_start();
+        let Some(split) = line.find(char::is_whitespace) else {
+            return false;
+        };
+        let rest = line[split..].trim_start();
+        let Some(split) = rest.find(char::is_whitespace) else {
+            return false;
+        };
+        let command = rest[split..].trim_start();
+        command == program || command.starts_with(&format!("{program} "))
+    })
+}
+
+fn inspect_codex_gui(expected_ws_url: Option<&str>, codex_home: Option<&Path>) -> CodexGuiStatus {
     #[cfg(target_os = "macos")]
     {
         let program = desktop_codex_program();
@@ -2109,8 +2440,14 @@ fn inspect_codex_gui(expected_ws_url: Option<&str>) -> CodexGuiStatus {
                 Ok(processes) => {
                     if let Some(program) = program.as_deref() {
                         status.gui_running = desktop_gui_running(&processes, program);
-                        status.stdio_app_server_count =
-                            stdio_app_server_pids(&processes, program).len();
+                        status.stdio_app_server_count = stdio_app_server_pids(&processes, program)
+                            .into_iter()
+                            .filter(|pid| {
+                                codex_home.is_none_or(|codex_home| {
+                                    process_uses_codex_home(*pid, codex_home)
+                                })
+                            })
+                            .count();
                     }
                 }
                 Err(error) => errors.push(format!("process list is not UTF-8: {error}")),
@@ -2121,11 +2458,61 @@ fn inspect_codex_gui(expected_ws_url: Option<&str>) -> CodexGuiStatus {
         status.inspection_error = (!errors.is_empty()).then(|| errors.join("; "));
         status
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let gui_program = Path::new(LINUX_DESKTOP_PROGRAM);
+        let codex_program = Path::new(LINUX_DESKTOP_CODEX_PATH);
+        let mut status = CodexGuiStatus {
+            available: gui_program.is_file() && codex_program.is_file(),
+            interposition_expected: expected_ws_url.is_some(),
+            ..CodexGuiStatus::default()
+        };
+        let mut errors = Vec::new();
+        match systemctl_user_environment("CODEX_APP_SERVER_WS_URL") {
+            Ok(value) => {
+                status.ws_environment_configured = value.is_some();
+                status.ws_environment_matches_expected =
+                    expected_ws_url.map(|expected| value.as_deref() == Some(expected));
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+        match systemctl_user_environment("CODEX_APP_SERVER_USE_LOCAL_DAEMON") {
+            Ok(value) => status.local_daemon_environment_set = value.is_some(),
+            Err(error) => errors.push(error.to_string()),
+        }
+        match Command::new("ps")
+            .args(["-axo", "pid=,ppid=,command="])
+            .env("LC_ALL", "C")
+            .output()
+        {
+            Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
+                Ok(processes) => {
+                    status.gui_running = linux_desktop_gui_running(&processes, gui_program);
+                    status.stdio_app_server_count =
+                        stdio_app_server_pids(&processes, codex_program)
+                            .into_iter()
+                            .filter(|pid| {
+                                codex_home.is_none_or(|codex_home| {
+                                    process_uses_codex_home(*pid, codex_home)
+                                })
+                            })
+                            .count();
+                }
+                Err(error) => errors.push(format!("process list is not UTF-8: {error}")),
+            },
+            Ok(output) => errors.push(format!("process inspection exited with {}", output.status)),
+            Err(error) => errors.push(format!("failed to inspect Codex GUI processes: {error}")),
+        }
+        status.inspection_error = (!errors.is_empty()).then(|| errors.join("; "));
+        status
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         CodexGuiStatus {
             interposition_expected: expected_ws_url.is_some(),
-            inspection_error: Some("Codex GUI inspection is available only on macOS".to_owned()),
+            inspection_error: Some(
+                "Codex GUI inspection is available only on macOS and Linux".to_owned(),
+            ),
             ..CodexGuiStatus::default()
         }
     }
@@ -2134,6 +2521,7 @@ fn inspect_codex_gui(expected_ws_url: Option<&str>) -> CodexGuiStatus {
 fn spawn_codex_gui_monitor(
     status: Arc<RwLock<CodexGuiStatus>>,
     expected_ws_url: Option<String>,
+    codex_home: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -2141,9 +2529,11 @@ fn spawn_codex_gui_monitor(
         loop {
             interval.tick().await;
             let expected_ws_url = expected_ws_url.clone();
-            let Ok(next) =
-                tokio::task::spawn_blocking(move || inspect_codex_gui(expected_ws_url.as_deref()))
-                    .await
+            let codex_home = codex_home.clone();
+            let Ok(next) = tokio::task::spawn_blocking(move || {
+                inspect_codex_gui(expected_ws_url.as_deref(), Some(&codex_home))
+            })
+            .await
             else {
                 return;
             };
@@ -2154,7 +2544,34 @@ fn spawn_codex_gui_monitor(
     })
 }
 
-fn conflicting_stdio_app_servers(program: &Path) -> Result<Vec<u32>> {
+fn process_uses_codex_home(pid: u32, codex_home: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{pid}/environ");
+        let Ok(environment) = fs::read(path) else {
+            return true;
+        };
+        let configured = environment
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(b"CODEX_HOME="))
+            .map(|value| PathBuf::from(String::from_utf8_lossy(value).into_owned()))
+            .unwrap_or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+                    .join(".codex")
+            });
+        fs::canonicalize(&configured).unwrap_or(configured)
+            == fs::canonicalize(codex_home).unwrap_or_else(|_| codex_home.to_path_buf())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, codex_home);
+        true
+    }
+}
+
+fn conflicting_stdio_app_servers(program: &Path, codex_home: &Path) -> Result<Vec<u32>> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,command="])
         .env("LC_ALL", "C")
@@ -2164,26 +2581,54 @@ fn conflicting_stdio_app_servers(program: &Path) -> Result<Vec<u32>> {
         bail!("process inspection exited with {}", output.status);
     }
     let stdout = String::from_utf8(output.stdout).context("process list is not UTF-8")?;
-    Ok(stdio_app_server_pids(&stdout, program))
+    Ok(stdio_app_server_pids(&stdout, program)
+        .into_iter()
+        .filter(|pid| process_uses_codex_home(*pid, codex_home))
+        .collect())
 }
 
-fn stdio_app_server_conflict(program: &Path) -> Option<String> {
-    match conflicting_stdio_app_servers(program) {
-        Ok(pids) if pids.is_empty() => None,
-        Ok(pids) => Some(format!(
+fn stdio_app_server_conflict(
+    program: &Path,
+    codex_home: &Path,
+    reject_desktop_stdio: bool,
+) -> Option<String> {
+    let mut programs = vec![program.to_path_buf()];
+    #[cfg(target_os = "linux")]
+    if reject_desktop_stdio {
+        programs.push(PathBuf::from(LINUX_DESKTOP_CODEX_PATH));
+    }
+    let mut pids = Vec::new();
+    for program in programs {
+        match conflicting_stdio_app_servers(&program, codex_home) {
+            Ok(found) => pids.extend(found),
+            Err(error) => {
+                return Some(format!(
+                    "cannot verify exclusive app-server writer ownership: {error}"
+                ));
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    if pids.is_empty() {
+        None
+    } else {
+        Some(format!(
             "refusing managed app-server while {} stdio app-server writer(s) use the same runtime; fully quit Codex/Desktop and relaunch it through WS interposition",
             pids.len()
-        )),
-        Err(error) => Some(format!(
-            "cannot verify exclusive app-server writer ownership: {error}"
-        )),
+        ))
     }
 }
 
-async fn wait_for_stdio_app_server_conflict(program: &Path) -> String {
+async fn wait_for_stdio_app_server_conflict(
+    program: &Path,
+    codex_home: &Path,
+    reject_desktop_stdio: bool,
+) -> String {
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        if let Some(message) = stdio_app_server_conflict(program) {
+        if let Some(message) = stdio_app_server_conflict(program, codex_home, reject_desktop_stdio)
+        {
             return message;
         }
     }
@@ -2365,6 +2810,7 @@ fn spawn_managed_app_server(
     spec: ManagedProcessSpec,
     shutdown: watch::Receiver<bool>,
     session_store: Arc<SessionStore>,
+    reject_desktop_stdio: bool,
 ) -> (
     tokio::task::JoinHandle<()>,
     watch::Receiver<ManagedProcessStatus>,
@@ -2378,6 +2824,7 @@ fn spawn_managed_app_server(
         status_tx,
         commands_rx,
         session_store,
+        reject_desktop_stdio,
     ));
     (
         task,
@@ -2578,12 +3025,15 @@ async fn supervise_managed_app_server(
     status_tx: watch::Sender<ManagedProcessStatus>,
     mut commands: mpsc::UnboundedReceiver<ManagedAppServerCommand>,
     session_store: Arc<SessionStore>,
+    reject_desktop_stdio: bool,
 ) {
     let mut restart_count = 0_u64;
     let mut backoff = Duration::from_millis(500);
     let mut pending_reply: Option<PendingRepairReply> = None;
     while !*shutdown.borrow() {
-        if let Some(message) = stdio_app_server_conflict(&spec.program) {
+        if let Some(message) =
+            stdio_app_server_conflict(&spec.program, session_store.home(), reject_desktop_stdio)
+        {
             status_tx.send_replace(ManagedProcessStatus {
                 running: false,
                 restart_count,
@@ -2641,7 +3091,11 @@ async fn supervise_managed_app_server(
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                                if let Some(message) = stdio_app_server_conflict(&spec.program) {
+                                if let Some(message) = stdio_app_server_conflict(
+                                    &spec.program,
+                                    session_store.home(),
+                                    reject_desktop_stdio,
+                                ) {
                                     status_tx.send_replace(ManagedProcessStatus {
                                         running: false,
                                         restart_count,
@@ -2813,7 +3267,11 @@ async fn supervise_managed_app_server(
                     None => return,
                 }
             }
-            message = wait_for_stdio_app_server_conflict(&spec.program) => {
+            message = wait_for_stdio_app_server_conflict(
+                &spec.program,
+                session_store.home(),
+                reject_desktop_stdio,
+            ) => {
                 eprintln!(
                     "[codex-bridge] stopping managed app-server reason=stdio_conflict pid={} detail={message}",
                     child.id().unwrap_or_default()
@@ -3028,9 +3486,23 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketStat
         );
     }
     let socket_metadata = if is_symlink {
-        fs::metadata(path).with_context(|| {
-            format!("failed to inspect managed socket target {}", path.display())
-        })?
+        match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::remove_file(path).with_context(|| {
+                    format!(
+                        "failed to remove dangling managed socket symlink {}",
+                        path.display()
+                    )
+                })?;
+                return Ok(ManagedSocketState::Vacant);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect managed socket target {}", path.display())
+                });
+            }
+        }
     } else {
         metadata
     };
@@ -3102,10 +3574,36 @@ async fn configure_desktop_interposition(listen: SocketAddr) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let ws_url = format!("ws://{listen}/rpc");
+        let assignment = format!("CODEX_APP_SERVER_WS_URL={ws_url}");
+        let status = TokioCommand::new("systemctl")
+            .args(["--user", "set-environment", &assignment])
+            .status()
+            .await
+            .context("failed to run systemctl --user set-environment")?;
+        if !status.success() {
+            bail!("systemctl --user set-environment failed with {status}");
+        }
+        let status = TokioCommand::new("systemctl")
+            .args([
+                "--user",
+                "unset-environment",
+                "CODEX_APP_SERVER_USE_LOCAL_DAEMON",
+            ])
+            .status()
+            .await
+            .context("failed to run systemctl --user unset-environment")?;
+        if !status.success() {
+            bail!("systemctl --user unset-environment failed with {status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = listen;
-        bail!("services.desktop_interposition is supported only on macOS")
+        bail!("services.desktop_interposition is supported only on macOS and Linux")
     }
 }
 
@@ -3130,7 +3628,29 @@ async fn desktop_interposition_environment_matches(listen: SocketAddr) -> Result
                     .trim()
                     .is_empty()))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let expected = format!("CODEX_APP_SERVER_WS_URL=ws://{listen}/rpc");
+        let output = TokioCommand::new("systemctl")
+            .args(["--user", "show-environment"])
+            .output()
+            .await
+            .context("failed to inspect systemd user environment")?;
+        if !output.status.success() {
+            bail!(
+                "systemctl --user show-environment exited with {}",
+                output.status
+            );
+        }
+        let environment =
+            String::from_utf8(output.stdout).context("systemd user environment is not UTF-8")?;
+        let lines = environment.lines().collect::<Vec<_>>();
+        Ok(lines.iter().any(|line| *line == expected)
+            && !lines
+                .iter()
+                .any(|line| line.starts_with("CODEX_APP_SERVER_USE_LOCAL_DAEMON=")))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = listen;
         Ok(false)
@@ -3198,6 +3718,25 @@ async fn main() -> Result<()> {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(default_codex_program);
+    let codex_compatibility = inspect_codex_cli(&codex_program);
+    let api_key = inspect_api_key(args.api_key_file.as_deref(), &codex_home)?;
+    if args.manage_app_server {
+        if !codex_compatibility.compatible() {
+            bail!(
+                "{}",
+                codex_compatibility
+                    .error
+                    .as_deref()
+                    .unwrap_or("Codex CLI compatibility check failed")
+            );
+        }
+        if !api_key.status.configured {
+            bail!(
+                "Codex API key is not configured; set {OPENAI_API_KEY_ENV}, configure api_key_file, or add an API-key model provider under {}",
+                codex_home.join("config.toml").display()
+            );
+        }
+    }
     let _managed_writer_lock = args
         .manage_app_server
         .then(|| acquire_managed_writer_lock(&codex_home))
@@ -3220,11 +3759,17 @@ async fn main() -> Result<()> {
         let socket = app_server_socket
             .as_deref()
             .context("managed app-server has no configured socket")?;
+        let mut app_server_environment = args.app_server_environment.clone();
+        app_server_environment.extend(api_key.environment.clone());
+        app_server_environment.insert(
+            CODEX_HOME_ENV.to_owned(),
+            session_store.home().to_string_lossy().into_owned(),
+        );
         let spec = ManagedProcessSpec {
             name: "app-server",
             program: codex_program.clone(),
             args: managed_app_server_args(socket, args.desktop_interposition),
-            environment: args.app_server_environment.clone(),
+            environment: app_server_environment,
             remove_environment: vec![
                 OsString::from("CODEX_APP_SERVER_WS_URL"),
                 OsString::from("CODEX_APP_SERVER_USE_LOCAL_DAEMON"),
@@ -3236,10 +3781,17 @@ async fn main() -> Result<()> {
             spec,
             managed_shutdown_rx.clone(),
             Arc::clone(&session_store),
+            args.desktop_interposition,
         );
         managed_tasks.push(task);
         managed_app_server_status = Some(status);
         managed_app_server_control = Some(control);
+        let check_backend = Arc::clone(&write_backend);
+        tokio::task::spawn_blocking(move || {
+            wait_for_managed_app_server_compatibility(&check_backend)
+        })
+        .await
+        .context("managed app-server compatibility check task failed")??;
     }
     if args.desktop_interposition {
         if !args.ws_bridge_listen.ip().is_loopback() {
@@ -3355,6 +3907,9 @@ async fn main() -> Result<()> {
         .iter()
         .map(|origin| parse_public_web_origin(origin))
         .collect::<Result<Vec<_>>>()?;
+    let public_origin = web_public_origins
+        .first()
+        .map(|origin| format!("{}://{}", origin.scheme, origin.authority));
 
     prepare_socket_path(&socket_path, secure_existing_parent).await?;
     let listener = UnixListener::bind(&socket_path)
@@ -3369,6 +3924,7 @@ async fn main() -> Result<()> {
         .then(|| format!("ws://{}/rpc", args.ws_bridge_listen));
     let codex_gui_status = Arc::new(RwLock::new(inspect_codex_gui(
         expected_desktop_ws_url.as_deref(),
+        Some(session_store.home()),
     )));
     let server_capabilities = Arc::new(RwLock::new(json!({
         "audio_transcription": {
@@ -3393,6 +3949,9 @@ async fn main() -> Result<()> {
         weekly_usage_history,
         runtime_mode: args.mode,
         config_path: args.config_path.clone(),
+        codex_compatibility,
+        api_key_status: api_key.status,
+        public_origin,
         manage_app_server: args.manage_app_server,
         desktop_interposition: args.desktop_interposition,
         ws_bridge_listen: args.desktop_interposition.then_some(args.ws_bridge_listen),
@@ -3406,7 +3965,11 @@ async fn main() -> Result<()> {
         server_capabilities,
         performance: Arc::new(PerformanceLog::default()),
     };
-    let codex_gui_monitor = spawn_codex_gui_monitor(codex_gui_status, expected_desktop_ws_url);
+    let codex_gui_monitor = spawn_codex_gui_monitor(
+        codex_gui_status,
+        expected_desktop_ws_url,
+        session_store.home().to_path_buf(),
+    );
     let capability_monitor = spawn_capability_monitor(bridge_state.clone());
     let composer_cache_monitor = spawn_composer_cache_monitor(bridge_state.clone());
     let hot_cache_task = spawn_hot_session_cache(
@@ -3907,7 +4470,12 @@ fn web_router(state: WebState) -> Router {
         .route("/assets/passkey.js", get(web_passkey_js))
         .route("/assets/app.css", get(web_app_css))
         .route("/assets/file-preview.js", get(web_file_preview_js))
+        .route("/manifest.webmanifest", get(web_manifest))
+        .route("/sw.js", get(web_service_worker))
+        .route("/offline.html", get(web_offline))
         .route("/app-icon.png", get(web_app_icon))
+        .route("/app-icon-192.png", get(web_app_icon_192))
+        .route("/app-icon-maskable-512.png", get(web_app_icon_maskable))
         .route("/apple-touch-icon.png", get(web_app_icon))
         .route("/favicon.ico", get(web_favicon))
         .route("/api/auth", get(web_auth_check))
@@ -3930,10 +4498,37 @@ fn web_router(state: WebState) -> Router {
         .route("/api/attachment-upload", post(web_attachment_upload))
         .route("/api/file-preview-content", get(web_file_preview_content))
         .route("/api/command", post(web_command))
+        .route("/api/client-log", post(web_client_log))
         .route("/api/events", get(web_events))
         .layer(DefaultBodyLimit::max(MAX_WEB_REQUEST_BYTES))
+        .layer(axum::middleware::from_fn(web_request_log))
         .layer(axum::middleware::from_fn(normalize_web_host))
         .with_state(state)
+}
+
+async fn web_request_log(request: AxumRequest, next: Next) -> HttpResponse {
+    let started = Instant::now();
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let request_id = web_request_id(request.headers());
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    if should_log_web_path(&path) {
+        eprintln!(
+            "[codex-bridge] {}",
+            json!({
+                "event": "web_http_complete",
+                "request_id": request_id,
+                "method": method,
+                "path": path,
+                "status": response.status().as_u16(),
+                "duration_ms": started.elapsed().as_millis() as u64,
+            })
+        );
+    }
+    response
 }
 
 async fn normalize_web_host(mut request: AxumRequest, next: Next) -> HttpResponse {
@@ -3947,6 +4542,166 @@ async fn normalize_web_host(mut request: AxumRequest, next: Next) -> HttpRespons
         }
     }
     next.run(request).await
+}
+
+fn should_log_web_path(path: &str) -> bool {
+    path == "/"
+        || path == "/login"
+        || path == "/sw.js"
+        || path == "/offline.html"
+        || path.starts_with("/api/")
+        || path == "/manifest.webmanifest"
+}
+
+fn web_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| {
+            (8..=96).contains(&value.len())
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "._:-".contains(character)
+                })
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let sequence = NEXT_WEB_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_millis());
+            format!("srv-{millis:x}-{sequence:x}")
+        })
+}
+
+fn sanitized_client_diagnostics(value: &Value) -> Value {
+    const FIELDS: &[&str] = &[
+        "type",
+        "seq",
+        "ts",
+        "request_id",
+        "command",
+        "status",
+        "duration_ms",
+        "close_code",
+        "retry_delay_ms",
+        "retry_count",
+        "writer_state",
+        "previous_writer_state",
+        "reason_code",
+        "error_code",
+        "event_sequence",
+        "skipped",
+        "route",
+        "visible",
+        "online",
+        "viewport_width",
+        "viewport_height",
+        "theme",
+        "visibility",
+        "connection",
+        "phase",
+        "count",
+        "bytes",
+        "metric",
+        "cache",
+        "source",
+        "session_id",
+    ];
+    let Some(input) = value.as_object() else {
+        return Value::Null;
+    };
+    let mut output = serde_json::Map::new();
+    for key in FIELDS {
+        let Some(value) = input.get(*key) else {
+            continue;
+        };
+        let sanitized = match value {
+            Value::Bool(_) => Some(value.clone()),
+            Value::Number(number) => number
+                .as_i64()
+                .filter(|number| number.unsigned_abs() <= 1_000_000_000_000)
+                .map(|number| Value::from(number)),
+            Value::String(text) => {
+                let text = text.trim();
+                if text.is_empty() || text.len() > 128 || text.chars().any(char::is_control) {
+                    None
+                } else if *key == "type" {
+                    text.chars()
+                        .all(|character| {
+                            character.is_ascii_alphanumeric() || "._-".contains(character)
+                        })
+                        .then(|| Value::String(text.to_owned()))
+                } else if *key == "route" {
+                    text.starts_with('/').then(|| {
+                        Value::String(text.split(['?', '#']).next().unwrap_or("/").to_owned())
+                    })
+                } else {
+                    Some(Value::String(text.to_owned()))
+                }
+            }
+            _ => None,
+        };
+        if let Some(sanitized) = sanitized {
+            output.insert((*key).to_owned(), sanitized);
+        }
+    }
+    if output.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(output)
+    }
+}
+
+async fn web_client_log(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> HttpResponse {
+    if !web_auth_allowed(&headers, state.auth.as_deref()) {
+        return basic_auth_required();
+    }
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        true,
+        &state.public_origins,
+    ) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    if body.len() > MAX_CLIENT_DIAGNOSTIC_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "diagnostic batch is too large",
+        )
+            .into_response();
+    }
+    let batch = match serde_json::from_slice::<ClientDiagnosticBatch>(&body) {
+        Ok(batch) => batch,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid diagnostic batch").into_response(),
+    };
+    if batch.events.len() > MAX_CLIENT_DIAGNOSTIC_EVENTS {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too many diagnostic events").into_response();
+    }
+    let events = batch
+        .events
+        .iter()
+        .map(sanitized_client_diagnostics)
+        .filter(|event| event.as_object().is_some_and(|event| !event.is_empty()))
+        .collect::<Vec<_>>();
+    if !events.is_empty() {
+        eprintln!(
+            "[codex-bridge] {}",
+            json!({
+                "event": "client_diagnostics",
+                "request_id": web_request_id(&headers),
+                "context": sanitized_client_diagnostics(&batch.context),
+                "events": events,
+            })
+        );
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn web_index(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
@@ -4345,17 +5100,89 @@ async fn web_file_preview_js(State(state): State<WebState>, headers: HeaderMap) 
     )
 }
 
+async fn web_manifest(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    web_public_asset_response(
+        &headers,
+        state.port,
+        &state.public_origins,
+        WEB_MANIFEST,
+        "application/manifest+json; charset=utf-8",
+        "public, no-cache",
+    )
+}
+
+async fn web_service_worker(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    let mut response = web_asset_response(
+        &state,
+        &headers,
+        WEB_SERVICE_WORKER,
+        "text/javascript; charset=utf-8",
+        "private, no-cache",
+    );
+    if response.status().is_success() {
+        response
+            .headers_mut()
+            .insert("service-worker-allowed", HeaderValue::from_static("/"));
+        response.headers_mut().insert(
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
+        );
+    }
+    response
+}
+
+async fn web_offline(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        WEB_OFFLINE,
+        "text/html; charset=utf-8",
+        "private, no-cache",
+    )
+}
+
 async fn web_app_icon(
     State(state): State<WebState>,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> HttpResponse {
-    web_asset_response(
-        &state,
+    web_public_asset_response(
         &headers,
+        state.port,
+        &state.public_origins,
         Bytes::from_static(WEB_APP_ICON),
         "image/png",
-        web_asset_cache_control(query.as_deref()),
+        web_public_asset_cache_control(query.as_deref()),
+    )
+}
+
+async fn web_app_icon_192(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
+    web_public_asset_response(
+        &headers,
+        state.port,
+        &state.public_origins,
+        Bytes::from_static(WEB_APP_ICON_192),
+        "image/png",
+        web_public_asset_cache_control(query.as_deref()),
+    )
+}
+
+async fn web_app_icon_maskable(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
+    web_public_asset_response(
+        &headers,
+        state.port,
+        &state.public_origins,
+        Bytes::from_static(WEB_APP_ICON_MASKABLE),
+        "image/png",
+        web_public_asset_cache_control(query.as_deref()),
     )
 }
 
@@ -4364,12 +5191,13 @@ async fn web_favicon(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> HttpResponse {
-    web_asset_response(
-        &state,
+    web_public_asset_response(
         &headers,
+        state.port,
+        &state.public_origins,
         Bytes::from_static(WEB_FAVICON),
         "image/x-icon",
-        web_asset_cache_control(query.as_deref()),
+        web_public_asset_cache_control(query.as_deref()),
     )
 }
 
@@ -5203,6 +6031,35 @@ fn web_asset_cache_control(query: Option<&str>) -> &'static str {
     }
 }
 
+fn web_public_asset_cache_control(query: Option<&str>) -> &'static str {
+    match web_asset_cache_control(query) {
+        "private, max-age=31536000, immutable" => "public, max-age=31536000, immutable",
+        _ => "public, no-cache",
+    }
+}
+
+fn web_public_asset_response(
+    headers: &HeaderMap,
+    port: u16,
+    public_origins: &[WebOrigin],
+    body: impl IntoResponse,
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> HttpResponse {
+    if !web_headers_allowed(headers, port, false, false, public_origins) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let mut response = body.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    response
+}
+
 async fn web_attachment_upload(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -5327,13 +6184,26 @@ async fn web_command(
                 .into_response()
         }
     };
+    let request_id = web_request_id(&headers);
+    let command = request.name();
+    let started = Instant::now();
     let bridge = state.bridge;
-    match tokio::task::spawn_blocking(move || dispatch(request, &bridge)).await {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => {
-            Json(Response::error("bridge_worker_error", error.to_string())).into_response()
-        }
-    }
+    let response = match tokio::task::spawn_blocking(move || dispatch(request, &bridge)).await {
+        Ok(response) => response,
+        Err(error) => Response::error("bridge_worker_error", error.to_string()),
+    };
+    eprintln!(
+        "[codex-bridge] {}",
+        json!({
+            "event": "web_command_complete",
+            "request_id": request_id,
+            "command": command,
+            "ok": response.ok,
+            "error_code": response.error.as_ref().map(|error| error.code.as_str()),
+            "duration_ms": started.elapsed().as_millis() as u64,
+        })
+    );
+    Json(response).into_response()
 }
 
 async fn web_events(
@@ -5354,12 +6224,34 @@ async fn web_events(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let bridge = state.bridge.clone();
+    let request_id = web_request_id(&headers);
     upgrade
-        .on_upgrade(move |socket| web_event_socket(socket, bridge))
+        .on_upgrade(move |socket| web_event_socket(socket, bridge, request_id))
         .into_response()
 }
 
-async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
+async fn web_event_socket(socket: WebSocket, bridge: BridgeState, request_id: String) {
+    let started = Instant::now();
+    eprintln!(
+        "[codex-bridge] {}",
+        json!({
+            "event": "web_ws_open",
+            "request_id": request_id,
+        })
+    );
+    let close_reason = web_event_socket_inner(socket, bridge).await;
+    eprintln!(
+        "[codex-bridge] {}",
+        json!({
+            "event": "web_ws_close",
+            "request_id": request_id,
+            "reason_code": close_reason,
+            "duration_ms": started.elapsed().as_millis() as u64,
+        })
+    );
+}
+
+async fn web_event_socket_inner(socket: WebSocket, bridge: BridgeState) -> &'static str {
     let (mut sender, mut receiver) = socket.split();
     let backend = Arc::clone(&bridge.write_backend);
     let Some(mut events) = backend.subscribe_app_server_events() else {
@@ -5373,7 +6265,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                 .into(),
             ))
             .await;
-        return;
+        return "app_server_unavailable";
     };
     if sender
         .send(AxumWsMessage::Text(
@@ -5388,7 +6280,20 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
         .await
         .is_err()
     {
-        return;
+        return "ready_send_failed";
+    }
+    for request in backend.pending_app_server_requests() {
+        if sender
+            .send(AxumWsMessage::Text(
+                json!({"type": "app_server_request", "message": request})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .is_err()
+        {
+            return "pending_request_send_failed";
+        }
     }
     if sender
         .send(AxumWsMessage::Text(
@@ -5404,7 +6309,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
         .await
         .is_err()
     {
-        return;
+        return "initial_snapshot_send_failed";
     }
     let snapshot_backend = Arc::clone(&backend);
     if let Ok(Ok(active_thread_ids)) =
@@ -5422,7 +6327,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
             .await
             .is_err()
         {
-            return;
+            return "thread_snapshot_send_failed";
         }
     }
     let mut app_server_status = bridge.managed_app_server_status.clone();
@@ -5431,7 +6336,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
     let mut service_snapshot = tokio::time::interval(Duration::from_secs(3));
     service_snapshot.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     service_snapshot.tick().await;
-    loop {
+    let close_reason = loop {
         tokio::select! {
             event = events.recv() => {
                 let event = match event {
@@ -5439,15 +6344,69 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         json!({"type": "bridge_event_gap", "skipped": skipped})
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break "event_bus_closed";
+                    }
                 };
                 if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
-                    break;
+                    break "event_send_failed";
                 }
             }
             message = receiver.next() => {
                 match message {
-                    Some(Ok(AxumWsMessage::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(AxumWsMessage::Close(_))) | None => break "client_closed",
+                    Some(Err(_)) => break "client_receive_error",
+                    Some(Ok(AxumWsMessage::Text(text))) => {
+                        if text.len() > 64 * 1024 {
+                            let _ = sender.send(AxumWsMessage::Text(json!({
+                                "type": "bridge_app_server_request_response",
+                                "ok": false,
+                                "error": "app-server response is too large",
+                            }).to_string().into())).await;
+                            continue;
+                        }
+                        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        if payload.get("type").and_then(Value::as_str)
+                            != Some("app_server_request_response")
+                        {
+                            continue;
+                        }
+                        let Some(request_id) = payload.get("id").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let Some(result) = payload
+                            .get("result")
+                            .filter(|result| result.is_object())
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        let response_backend = Arc::clone(&backend);
+                        let response = tokio::task::spawn_blocking(move || {
+                            response_backend.respond_to_app_server_request(request_id, result)
+                        })
+                        .await
+                        .ok()
+                        .and_then(|response| response.ok());
+                        let event = match response {
+                            Some(response) => json!({
+                                "type": "bridge_app_server_request_response",
+                                "ok": true,
+                                "response": response,
+                            }),
+                            None => json!({
+                                "type": "bridge_app_server_request_response",
+                                "ok": false,
+                                "request_id": request_id,
+                                "error": "failed to send app-server request response",
+                            }),
+                        };
+                        if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
+                            break "request_response_send_failed";
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -5459,7 +6418,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                     "runtime_resources": runtime_resources_snapshot(&bridge),
                 });
                 if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
-                    break;
+                    break "service_snapshot_send_failed";
                 }
             }
             _ = wait_for_managed_service_change(
@@ -5474,11 +6433,12 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                     "runtime_resources": runtime_resources_snapshot(&bridge),
                 });
                 if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
-                    break;
+                    break "service_change_send_failed";
                 }
             }
         }
-    }
+    };
+    close_reason
 }
 
 async fn wait_for_optional_status_change(
@@ -5512,13 +6472,102 @@ fn active_loaded_thread_ids(
     for thread_id in loaded {
         let thread = backend.app_server_rpc(
             "thread/read",
-            json!({"threadId": thread_id, "includeTurns": false}),
+            json!({"threadId": thread_id.as_str(), "includeTurns": false}),
         )?;
         if thread_result_is_active(&thread) {
             active.push(thread_id);
         }
     }
     Ok(active)
+}
+
+fn wait_for_managed_app_server_compatibility(backend: &CodexCliBackend) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match backend.app_server_rpc("thread/list", json!({"limit": 1})) {
+            Ok(_) => {
+                let runtime = backend
+                    .app_server_runtime_info()
+                    .context("app-server initialize returned no runtime information")?;
+                let version = runtime
+                    .user_agent
+                    .as_deref()
+                    .and_then(app_server_version_from_user_agent)
+                    .context("app-server initialize userAgent has no version")?;
+                if version != APP_SERVER_SCHEMA_VERSION {
+                    bail!(
+                        "managed app-server version {version} does not match the tested schema {}; stop the old app-server or install the pinned Codex CLI",
+                        APP_SERVER_SCHEMA_VERSION
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) if matches!(error.code, "app_server_unavailable" | "app_server_timeout") => {
+                last_error = Some(error.message);
+            }
+            Err(error) => {
+                bail!(
+                    "managed app-server compatibility check failed ({}): {}",
+                    error.code,
+                    error.message
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "managed app-server did not become compatible within 20 seconds{}",
+        last_error
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    )
+}
+
+#[derive(Debug, Default)]
+struct AppServerRestartPreflight {
+    active_thread_ids: Vec<String>,
+    queued_inputs: usize,
+}
+
+fn app_server_restart_preflight(
+    backend: &CodexCliBackend,
+) -> std::result::Result<AppServerRestartPreflight, BackendFailure> {
+    let loaded = loaded_thread_ids(&backend.app_server_rpc("thread/loaded/list", json!({}))?);
+    let mut preflight = AppServerRestartPreflight::default();
+    for thread_id in loaded {
+        let thread = backend.app_server_rpc(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+        )?;
+        if thread_result_is_active(&thread) {
+            preflight.active_thread_ids.push(thread_id.clone());
+        }
+        let mut cursor = Value::Null;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let page = backend.app_server_rpc(
+                "thread/queue/list",
+                json!({"threadId": thread_id.as_str(), "limit": 100, "cursor": cursor}),
+            )?;
+            preflight.queued_inputs = preflight.queued_inputs.saturating_add(
+                page.get("data")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            );
+            let Some(next) = page.get("nextCursor").and_then(Value::as_str) else {
+                break;
+            };
+            if !seen_cursors.insert(next.to_owned()) {
+                return Err(BackendFailure {
+                    code: "app_server_protocol_error",
+                    message: "thread/queue/list repeated a pagination cursor".to_owned(),
+                });
+            }
+            cursor = Value::String(next.to_owned());
+        }
+    }
+    Ok(preflight)
 }
 
 fn web_headers_allowed(
@@ -7427,10 +8476,26 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             }
         }
         Request::Status => {
-            if write_backend.app_server_socket().is_some() {
-                let _ = write_backend.app_server_rpc("thread/loaded/list", json!({}));
-            }
             let runtime = write_backend.app_server_runtime_info();
+            let selected_thread_id = selected_thread
+                .read()
+                .ok()
+                .and_then(|selected| selected.clone());
+            let selected_writer = selected_thread_id
+                .as_deref()
+                .map(|thread_id| write_backend.thread_writer_state(thread_id))
+                .unwrap_or(ThreadWriterState::Unknown);
+            let active_turns = active_loaded_thread_ids(write_backend).map_or_else(
+                |_| {
+                    state
+                        .session_run_states
+                        .snapshot()
+                        .values()
+                        .filter(|state| **state == "active")
+                        .count()
+                },
+                |thread_ids| thread_ids.len(),
+            );
             let runtime_kind = if is_desktop_codex_program(write_backend.program()) {
                 "bundled"
             } else {
@@ -7451,6 +8516,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             let capabilities = refresh_server_capabilities(state);
             Response::success(json!({
             "service": "codex-bridge",
+            "bridge_version": env!("CARGO_PKG_VERSION"),
             "status": "ready",
             "protocol_version": PROTOCOL_VERSION,
             "socket": socket_path,
@@ -7463,12 +8529,19 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             "managed_services": managed_services_snapshot(state),
             "runtime_resources": runtime_resources_snapshot(state),
             "capabilities": capabilities,
+            "codex_compatibility": state.codex_compatibility.clone(),
+            "api_key": state.api_key_status.clone(),
+            "public_origin": state.public_origin.clone(),
+            "upgrade_preflight": {
+                "active_turns": active_turns,
+                "selected_thread_id": selected_thread_id,
+                "selected_writer": thread_writer_lock_value(selected_writer, None),
+            },
             "rollout_store": {
                 "available": session_store.is_available(),
                 "codex_home": session_store.home(),
                 "read_only": true,
             },
-            "selected_thread_id": selected_thread.read().ok().and_then(|selected| selected.clone()),
             "write_backend": {
                 "codex_program": write_backend.program(),
                 "app_server_socket": write_backend.app_server_socket(),
@@ -8414,7 +9487,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 .read()
                 .map(|config| config.clone())
                 .unwrap_or_default();
-            let (weekly_usage, weekly_usage_error) = state
+            let weekly = state
                 .composer_cache
                 .weekly
                 .read()
@@ -8424,8 +9497,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "thread_id": thread_id,
                 "model": resolved_model.or(config_model),
                 "reasoning_effort": resolved_effort.or(config_effort),
-                "weekly_usage": weekly_usage,
-                "weekly_usage_error": weekly_usage_error,
+                "weekly_usage_supported": weekly.supported,
+                "weekly_usage": weekly.usage,
+                "weekly_usage_error": weekly.error,
             }))
         }
         Request::ThreadGoalGet { thread_id } => {
@@ -9445,10 +10519,42 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "app-server restart requires services.manage_app_server",
                 );
             };
+            let preflight = match app_server_restart_preflight(write_backend) {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    return Response::error(
+                        "app_server_restart_preflight_failed",
+                        format!(
+                            "cannot verify active work before restarting app-server: {}",
+                            error.message
+                        ),
+                    );
+                }
+            };
+            if !preflight.active_thread_ids.is_empty() {
+                return Response::error(
+                    "app_server_active_turns",
+                    format!(
+                        "finish or interrupt {} active turn(s) before restarting app-server",
+                        preflight.active_thread_ids.len()
+                    ),
+                );
+            }
+            if preflight.queued_inputs > 0 {
+                return Response::error(
+                    "app_server_queued_inputs",
+                    format!(
+                        "withdraw or deliver {} queued input(s) before restarting app-server",
+                        preflight.queued_inputs
+                    ),
+                );
+            }
             match control.restart() {
                 Ok(()) => Response::success(json!({
                     "action": "managed_app_server_restart",
                     "status": "requested",
+                    "active_turns": 0,
+                    "queued_inputs": 0,
                 })),
                 Err(error) => Response::error("app_server_restart_failed", error.to_string()),
             }
@@ -11379,6 +12485,68 @@ impl Drop for SocketGuard {
 
 #[cfg(test)]
 mod tests {
+    fn fake_restart_preflight(active: bool, queued: bool) -> super::AppServerRestartPreflight {
+        use std::os::unix::net::UnixListener;
+        use tungstenite::Message;
+
+        let directory = super::tests::unique_test_dir("restart-preflight");
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().unwrap().0;
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let initialize: serde_json::Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                serde_json::json!({"id": initialize["id"], "result": {"userAgent": "codex-cli/0.164.0"}})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+            let _initialized = ws.read().unwrap();
+            for expected in ["thread/loaded/list", "thread/read", "thread/queue/list"] {
+                let request: serde_json::Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], expected);
+                let result = match expected {
+                    "thread/loaded/list" => serde_json::json!({"data": ["thread-1"]}),
+                    "thread/read" => serde_json::json!({"thread": {"status": {
+                        "type": if active { "active" } else { "idle" }
+                    }}}),
+                    "thread/queue/list" => serde_json::json!({"data": if queued {
+                        vec![serde_json::json!({"id": "queue-1"})]
+                    } else {
+                        Vec::new()
+                    }, "nextCursor": null}),
+                    _ => unreachable!(),
+                };
+                ws.send(Message::Text(
+                    serde_json::json!({"id": request["id"], "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            }
+        });
+        let backend = super::CodexCliBackend::new(PathBuf::from("/unused"), Some(socket));
+        let preflight = super::app_server_restart_preflight(&backend).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        preflight
+    }
+
+    #[test]
+    fn app_server_restart_preflight_rejects_active_turns_and_queued_inputs() {
+        let active = fake_restart_preflight(true, false);
+        assert_eq!(active.active_thread_ids, ["thread-1"]);
+        assert_eq!(active.queued_inputs, 0);
+
+        let queued = fake_restart_preflight(false, true);
+        assert!(queued.active_thread_ids.is_empty());
+        assert_eq!(queued.queued_inputs, 1);
+    }
+
     #[test]
     fn reliable_queue_starts_after_active_turn_ends() {
         use std::os::unix::net::UnixListener;
@@ -11597,6 +12765,20 @@ mod tests {
         ))
     }
 
+    fn init_git_fixture(path: &Path) {
+        for args in [
+            ["init", "--quiet"].as_slice(),
+            ["config", "core.hooksPath", "/dev/null"].as_slice(),
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+
     #[test]
     fn managed_app_server_args_seed_desktop_mcp_transport_only_for_interposition() {
         let socket = Path::new("/tmp/codex-app-server.sock");
@@ -11639,6 +12821,56 @@ mod tests {
             stdio_app_server_pids(processes, program),
             [101, 102, 107, 108]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_detection_matches_the_installed_package_layout() {
+        let program = Path::new(LINUX_DESKTOP_CODEX_PATH);
+        let processes = format!(
+            r#"
+  10 1 {LINUX_DESKTOP_PROGRAM}
+  11 10 {LINUX_DESKTOP_CODEX_PATH} app-server --listen stdio://
+  12 1 {LINUX_DESKTOP_CODEX_PATH} app-server --listen unix:///tmp/bridge.sock
+"#
+        );
+
+        assert_eq!(stdio_app_server_pids(&processes, program), [11]);
+        assert!(linux_desktop_gui_running(
+            &processes,
+            Path::new(LINUX_DESKTOP_PROGRAM)
+        ));
+        assert!(is_desktop_codex_program(program));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_conflict_detection_uses_each_process_codex_home() {
+        let root = unique_test_dir("desktop-codex-home");
+        let matching_home = root.join("matching");
+        let other_home = root.join("other");
+        fs::create_dir_all(&matching_home).unwrap();
+        fs::create_dir_all(&other_home).unwrap();
+
+        let mut matching = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .env(CODEX_HOME_ENV, &matching_home)
+            .spawn()
+            .unwrap();
+        let mut other = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .env(CODEX_HOME_ENV, &other_home)
+            .spawn()
+            .unwrap();
+
+        assert!(process_uses_codex_home(matching.id(), &matching_home));
+        assert!(!process_uses_codex_home(other.id(), &matching_home));
+
+        matching.kill().unwrap();
+        other.kill().unwrap();
+        matching.wait().unwrap();
+        other.wait().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11904,12 +13136,7 @@ mod tests {
         let workspace = root.join("source");
         let sibling = root.join("sibling");
         fs::create_dir_all(&workspace).unwrap();
-        assert!(Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&workspace)
-            .status()
-            .unwrap()
-            .success());
+        init_git_fixture(&workspace);
         fs::write(workspace.join("README.md"), "fixture\n").unwrap();
         assert!(Command::new("git")
             .args(["add", "README.md"])
@@ -12081,12 +13308,7 @@ mod tests {
         let repository = root.join("source");
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&repository).unwrap();
-        assert!(Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&repository)
-            .status()
-            .unwrap()
-            .success());
+        init_git_fixture(&repository);
         fs::write(repository.join("README.md"), "fixture\n").unwrap();
         assert!(Command::new("git")
             .args(["add", "README.md"])
@@ -12139,12 +13361,7 @@ mod tests {
     fn workspace_diff_reports_only_uncommitted_changes() {
         let repository = unique_test_dir("workspace-diff");
         fs::create_dir_all(&repository).unwrap();
-        assert!(Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&repository)
-            .status()
-            .unwrap()
-            .success());
+        init_git_fixture(&repository);
         fs::write(repository.join("tracked.txt"), "old\n").unwrap();
         assert!(Command::new("git")
             .args(["add", "tracked.txt"])
@@ -12233,6 +13450,61 @@ mod tests {
     }
 
     #[test]
+    fn web_diagnostics_request_ids_are_bounded_and_correlated() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("client-request-1234"),
+        );
+        assert_eq!(web_request_id(&headers), "client-request-1234");
+
+        headers.insert("x-request-id", HeaderValue::from_static("bad request id"));
+        let generated = web_request_id(&headers);
+        assert!(generated.starts_with("srv-"));
+        assert!(generated.len() <= 96);
+    }
+
+    #[test]
+    fn client_diagnostics_drop_sensitive_and_nested_fields() {
+        let sanitized = sanitized_client_diagnostics(&json!({
+            "type": "command_complete",
+            "command": "thread_watch",
+            "request_id": "request-1234",
+            "duration_ms": 42,
+            "writer_state": "owned",
+            "route": "/api/command?token=secret#thread",
+            "text": "private prompt",
+            "token": "secret-token",
+            "nested": {"path": "/home/private"}
+        }));
+
+        assert_eq!(
+            sanitized,
+            json!({
+                "type": "command_complete",
+                "command": "thread_watch",
+                "request_id": "request-1234",
+                "duration_ms": 42,
+                "writer_state": "owned",
+                "route": "/api/command"
+            })
+        );
+        assert!(sanitized_client_diagnostics(&json!({"type": "bad type"})).is_null());
+    }
+
+    #[test]
+    fn web_request_logging_skips_static_asset_noise() {
+        assert!(should_log_web_path("/"));
+        assert!(should_log_web_path("/login"));
+        assert!(should_log_web_path("/sw.js"));
+        assert!(should_log_web_path("/offline.html"));
+        assert!(should_log_web_path("/api/command"));
+        assert!(should_log_web_path("/manifest.webmanifest"));
+        assert!(!should_log_web_path("/assets/app.js"));
+        assert!(!should_log_web_path("/app-icon.png"));
+    }
+
+    #[test]
     fn app_server_version_comes_from_initialize_user_agent() {
         assert_eq!(
             app_server_version_from_user_agent("codex_cli_rs/0.152.1 (macos)"),
@@ -12242,6 +13514,100 @@ mod tests {
         assert_eq!(parse_thread_cache_limit("3"), Ok(3));
         assert!(parse_thread_cache_limit("0").is_err());
         assert!(parse_thread_cache_limit("65").is_err());
+    }
+
+    #[test]
+    fn codex_provider_key_and_base_url_are_detected_without_returning_values() {
+        let home = unique_test_dir("provider-key");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "private"
+
+[model_providers.private]
+name = "Private provider"
+base_url = "https://provider.example/v1"
+experimental_bearer_token = "test-only-token"
+requires_openai_auth = false
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(codex_provider_api_key_status(&home).unwrap(), (true, true));
+        let runtime = inspect_api_key(None, &home).unwrap();
+        assert_eq!(runtime.status.source, "codex_config");
+        assert!(runtime.status.configured);
+        assert!(runtime.status.base_url_configured);
+        assert!(runtime.environment.is_empty());
+        assert!(!serde_json::to_string(&runtime.status)
+            .unwrap()
+            .contains("test-only-token"));
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn managed_codex_cli_gate_requires_the_pinned_version_and_unix_listener() {
+        let root = unique_test_dir("codex-cli-gate");
+        fs::create_dir_all(&root).unwrap();
+        let compatible_program = root.join("codex-compatible");
+        fs::write(
+            &compatible_program,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.164.0'; else echo '--listen unix://'; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compatible_program, fs::Permissions::from_mode(0o700)).unwrap();
+        let compatible = inspect_codex_cli(&compatible_program);
+        assert!(compatible.compatible());
+        assert_eq!(
+            compatible.cli_version.as_deref(),
+            Some(APP_SERVER_SCHEMA_VERSION)
+        );
+        assert!(compatible.unix_listener_supported);
+
+        let mismatch_program = root.join("codex-mismatch");
+        fs::write(
+            &mismatch_program,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.163.0'; else echo '--listen unix://'; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&mismatch_program, fs::Permissions::from_mode(0o700)).unwrap();
+        let mismatch = inspect_codex_cli(&mismatch_program);
+        assert!(!mismatch.compatible());
+        assert!(mismatch
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(APP_SERVER_SCHEMA_VERSION)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn api_key_file_must_be_private_and_is_not_exposed_in_status() {
+        let root = unique_test_dir("api-key-file");
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".codex/config.toml"), "[features]\n").unwrap();
+        let key_path = root.join("api-key");
+        fs::write(&key_path, "test-only-api-key\n").unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let runtime = inspect_api_key(Some(&key_path), &root.join(".codex")).unwrap();
+        assert_eq!(runtime.status.source, "file");
+        assert_eq!(
+            runtime
+                .environment
+                .get(OPENAI_API_KEY_ENV)
+                .map(String::as_str),
+            Some("test-only-api-key")
+        );
+        assert!(!serde_json::to_string(&runtime.status)
+            .unwrap()
+            .contains("test-only-api-key"));
+
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_api_key(&key_path).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12255,19 +13621,21 @@ mod tests {
 mode = "standalone"
 app_server_thread_cache = 7
 projectless_workspace_root = "~/Documents/Codex Chats"
+api_key_file = "~/private-api-key"
 
 [web_ui]
 enabled = true
 name = "Codex on Test Host"
 listen = "127.0.0.1:19091"
 user = "remote"
-no_auth = true
+no_auth = false
 tls_cert_file = "~/bridge-cert.pem"
 tls_private_key_file = "~/bridge-key.pem"
 public_origins = ["https://codex.example.com"]
 
 [services]
 manage_app_server = true
+desktop_interposition = true
 
 [services.app_server_environment]
 HTTPS_PROXY = "http://127.0.0.1:7897"
@@ -12289,7 +13657,11 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(resolved.web_ui_name, "Codex on Test Host");
         assert_eq!(resolved.web_ui_listen, "127.0.0.1:19091".parse().unwrap());
         assert_eq!(resolved.web_ui_user, "remote");
-        assert!(resolved.web_ui_no_auth);
+        assert!(!resolved.web_ui_no_auth);
+        assert!(resolved
+            .api_key_file
+            .as_deref()
+            .is_some_and(|path| path.ends_with("private-api-key")));
         assert!(resolved
             .web_ui_tls_cert_file
             .as_deref()
@@ -12300,7 +13672,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .is_some_and(|path| path.ends_with("bridge-key.pem")));
         assert_eq!(resolved.web_ui_public_origin, ["https://codex.example.com"]);
         assert!(resolved.manage_app_server);
-        assert!(!resolved.desktop_interposition);
+        assert!(resolved.desktop_interposition);
         assert_eq!(
             resolved
                 .app_server_environment
@@ -12308,6 +13680,26 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 .map(String::as_str),
             Some("http://127.0.0.1:7897")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn public_origins_require_bridge_authentication() {
+        let root = unique_test_dir("bridge-public-auth");
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            "[web_ui]\nno_auth = true\npublic_origins = [\"https://codex.example.com\"]\n",
+        )
+        .unwrap();
+        let args =
+            Args::try_parse_from(["codex-bridge", "--config", config_path.to_str().unwrap()])
+                .unwrap();
+        assert!(resolve_args(args)
+            .unwrap_err()
+            .to_string()
+            .contains("web_ui.no_auth must remain false"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -12350,7 +13742,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let rendered = render_web_index(WEB_INDEX, "Codex <Lab> & Friends");
         assert_eq!(
             rendered.matches("Codex &lt;Lab&gt; &amp; Friends").count(),
-            2
+            3
         );
         assert!(!rendered.contains("Codex <Lab> & Friends"));
         assert!(!rendered.contains(DEFAULT_WEB_UI_NAME));
@@ -12432,8 +13824,12 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             preserve_on_shutdown: false,
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (task, mut status, control) =
-            spawn_managed_app_server(spec, shutdown_rx, Arc::new(SessionStore::new(root.clone())));
+        let (task, mut status, control) = spawn_managed_app_server(
+            spec,
+            shutdown_rx,
+            Arc::new(SessionStore::new(root.clone())),
+            false,
+        );
         tokio::time::timeout(Duration::from_secs(1), status.changed())
             .await
             .unwrap()
@@ -12667,6 +14063,25 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[tokio::test]
+    async fn managed_socket_cleanup_removes_dangling_symlink() {
+        let root = unique_test_dir("managed-dangling-socket");
+        fs::create_dir_all(&root).unwrap();
+        let socket = root.join("managed.sock");
+        let missing_target = root.join("managed.lock");
+        std::os::unix::fs::symlink(&missing_target, &socket).unwrap();
+
+        assert_eq!(
+            prepare_managed_process_socket(&socket).await.unwrap(),
+            ManagedSocketState::Vacant
+        );
+        assert_eq!(
+            fs::symlink_metadata(&socket).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn managed_socket_adoption_rejects_an_unstable_listener() {
         let socket = PathBuf::from(format!(
             "/tmp/cb-stable-{}-{}.sock",
@@ -12758,8 +14173,12 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             preserve_on_shutdown: true,
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (task, mut status, _control) =
-            spawn_managed_app_server(spec, shutdown_rx, Arc::new(SessionStore::new(root.clone())));
+        let (task, mut status, _control) = spawn_managed_app_server(
+            spec,
+            shutdown_rx,
+            Arc::new(SessionStore::new(root.clone())),
+            false,
+        );
         tokio::time::timeout(Duration::from_secs(1), status.changed())
             .await
             .unwrap()
@@ -12918,6 +14337,48 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(!session_cookie_allowed(&headers, &auth));
         assert!(!web_auth_allowed(&headers, Some(&auth)));
         assert!(web_auth_allowed(&HeaderMap::new(), None));
+    }
+
+    #[test]
+    fn pwa_install_metadata_is_public_and_host_restricted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:47653"));
+        let response = web_public_asset_response(
+            &headers,
+            47653,
+            &[],
+            WEB_MANIFEST,
+            "application/manifest+json; charset=utf-8",
+            "public, no-cache",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, no-cache"
+        );
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert_eq!(
+            web_public_asset_cache_control(Some("v=63ac7fbdfe63")),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            web_public_asset_cache_control(Some("v=stale")),
+            "public, no-cache"
+        );
+
+        headers.insert(header::HOST, HeaderValue::from_static("evil.example:47653"));
+        assert_eq!(
+            web_public_asset_response(
+                &headers,
+                47653,
+                &[],
+                WEB_MANIFEST,
+                "application/manifest+json; charset=utf-8",
+                "public, no-cache",
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
@@ -13282,6 +14743,26 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn account_rate_limits_require_openai_auth_and_an_authenticated_account() {
+        assert!(!account_rate_limits_available(&json!({
+            "account": null,
+            "requiresOpenaiAuth": false
+        })));
+        assert!(!account_rate_limits_available(&json!({
+            "account": {"type": "chatgpt"},
+            "requiresOpenaiAuth": false
+        })));
+        assert!(!account_rate_limits_available(&json!({
+            "account": null,
+            "requiresOpenaiAuth": true
+        })));
+        assert!(account_rate_limits_available(&json!({
+            "account": {"type": "apiKey"},
+            "requiresOpenaiAuth": true
+        })));
+    }
+
+    #[test]
     fn composer_cache_refreshes_each_minute_with_active_work_and_each_twenty_minutes_idle() {
         assert_eq!(composer_refresh_interval(true), Duration::from_secs(60));
         assert_eq!(composer_refresh_interval(false), Duration::from_secs(1200));
@@ -13447,20 +14928,38 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     fn vite_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
         assert!(WEB_INDEX.contains("/assets/app.js"));
         assert!(WEB_INDEX.contains("/assets/app.css"));
+        assert!(WEB_INDEX.contains("/manifest.webmanifest"));
+        assert!(WEB_INDEX.contains("/app-icon-192.png"));
+        assert!(WEB_INDEX.contains("name=\"theme-color\""));
         assert!(WEB_INDEX.contains("/assets/app.js?v="));
         assert!(WEB_INDEX.contains("/assets/app.css?v="));
+        assert!(WEB_MANIFEST.contains("\"display\": \"standalone\""));
+        assert!(WEB_MANIFEST.contains("\"id\": \"/\""));
+        assert!(WEB_MANIFEST.contains("\"scope\": \"/\""));
+        assert!(WEB_MANIFEST.contains("192x192"));
+        assert!(WEB_MANIFEST.contains("maskable"));
+        assert!(WEB_SERVICE_WORKER.contains("addEventListener(\"fetch\""));
+        assert!(WEB_SERVICE_WORKER.contains("self.skipWaiting()"));
+        assert!(WEB_SERVICE_WORKER.contains("const PRECACHE"));
+        assert!(WEB_SERVICE_WORKER.contains("const OFFLINE_URL = \"/offline.html\""));
+        assert!(WEB_SERVICE_WORKER.contains("request.mode === \"navigate\""));
+        assert!(WEB_SERVICE_WORKER.contains("caches.match(OFFLINE_URL)"));
+        assert!(!WEB_SERVICE_WORKER.contains("/api/"));
+        assert!(WEB_OFFLINE.contains("Sessions and credentials are never cached"));
         assert!(WEB_APP_JS.contains("./file-preview.js"));
         assert!(WEB_FILE_PREVIEW_JS.contains("createFilePreviewController"));
 
         let source = concat!(
             include_str!("../../../web-ui/index.html"),
             include_str!("../../../web-ui/src/api.js"),
+            include_str!("../../../web-ui/src/approval-state.js"),
             include_str!("../../../web-ui/src/auth-gate.js"),
             include_str!("../../../web-ui/src/browser-notifications.js"),
             include_str!("../../../web-ui/src/main.js"),
             include_str!("../../../web-ui/src/markdown.js"),
             include_str!("../../../web-ui/src/message-cache.js"),
             include_str!("../../../web-ui/src/project-state.js"),
+            include_str!("../../../web-ui/src/pwa.js"),
             include_str!("../../../web-ui/src/runtime-architecture.js"),
             include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/composer-state.js"),
@@ -13494,11 +14993,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "send",
             "steer",
             "scroll",
-            "pending",
             "pending_messages",
             "pending_message_delete",
-            "approve",
-            "decline",
             "interrupt",
             "host_exec",
             "app_server_rpc",
@@ -13541,11 +15037,21 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "id=\"languageBtn\"",
             "id=\"settingsPanel\"",
             "id=\"componentStatus\"",
+            "id=\"connectionDiagnostics\"",
+            "renderConnectionDiagnostics",
+            "id=\"approvalPanel\"",
+            "approvalRequestModel",
+            "approvalResponseFor",
+            "respondToServerRequest",
+            "app_server_request_response",
+            "serverRequest/resolved",
             "id=\"runtimeArchitecture\"",
             "id=\"resourceStatus\"",
             "runtime-architecture-disclosure",
             "runtimeArchitectureModel",
             "bridge_service_snapshot",
+            "bridge_app_server_connection",
+            "event.status === \"connected\"",
             "renderManagedServices",
             "github.com/hitsmaxft/codex-bridge",
             "setComposerSubmitting",
@@ -13590,19 +15096,23 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "outbox-mode",
             "border: 1px dashed",
             "classList.add(\"focused\", \"input-focused\")",
-            "border-width: 2px",
+            "grid-template-areas: \"mode input attach submit\"",
+            "mobile-list-actions",
         ] {
             assert!(source.contains(marker), "missing {marker}");
         }
         assert!(WEB_APP_JS.contains("pending_message_delete"));
         assert!(WEB_APP_CSS.contains("touch-action:pan-y"));
+        assert!(WEB_SERVICE_WORKER.contains("fetch"));
         assert!(source.contains("background: var(--control-bg)"));
         assert!(source.contains("background: var(--code-bg)"));
         assert_eq!(source.matches("\n.message.user {").count(), 1);
-        assert_eq!(source.matches(".composer-shell {").count(), 2);
+        assert!(source.matches(".composer-shell {").count() >= 2);
         assert_eq!(source.matches("\n.outbox-item {").count(), 1);
         assert!(!source.contains("--mobile-code"));
         assert!(!source.contains("project-path"));
+        assert!(source.contains("#sidebar {\n    position: fixed"));
+        assert!(!source.contains("  aside {\n    position: fixed"));
         assert!(!source.contains("max-height: min(52dvh, 480px)"));
         assert!(!source.contains("sessionStorage"));
         assert!(!source.contains("state.delivery"));

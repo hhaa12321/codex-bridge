@@ -1,4 +1,5 @@
 import { createAuthenticationGate } from "./auth-gate.js";
+import { diagnostics } from "./client-diagnostics.js";
 import { createEventSequenceTracker } from "./event-sequence.js";
 import { sendFileUpload } from "./file-upload.js";
 import { monitoredJson, monitoredText, trafficMonitor } from "./traffic-monitor.js";
@@ -11,6 +12,8 @@ let eventSocket;
 let eventRetryTimer;
 let eventRetryDelay = 500;
 let eventStreamUnavailable = false;
+let eventSocketRequestId = null;
+let eventSocketOpenedAt = 0;
 const eventListeners = new Set();
 const eventSequence = createEventSequenceTracker();
 const performanceBuckets = new Map();
@@ -135,6 +138,10 @@ async function sendCommand(request) {
     const client = await demoClient;
     return client.demoCommand(request);
   }
+  const requestId = crypto.randomUUID(),
+    started = performance.now(),
+    commandName = request.command || "command";
+  diagnostics.record("command_start", { request_id: requestId, command: commandName });
   const timeoutMs = ["send", "steer", "temporary_turn_start"].includes(request.command)
       ? 30_000
       : ["pending_messages", "thread_activity", "thread_watch"].includes(request.command)
@@ -145,19 +152,49 @@ async function sendCommand(request) {
   try {
     const response = await fetch("/api/command", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Request-Id": requestId },
       body: JSON.stringify(request),
       ...(controller ? { signal: controller.signal } : {}),
     });
     if (response.status === 401) {
       if (trafficMonitor.enabled) await monitoredText(response, request.command || "command");
       const error = new Error("authentication expired; reload the page to sign in again");
+      diagnostics.record("command_error", {
+        request_id: requestId,
+        command: commandName,
+        error_code: "authentication_expired",
+        duration_ms: performance.now() - started,
+      });
       authentication.block(error);
       throw error;
     }
-    return await monitoredJson(response, request.command || "command");
+    const data = await monitoredJson(response, commandName);
+    diagnostics.record("command_complete", {
+      request_id: requestId,
+      command: commandName,
+      status: data?.ok === false ? "error" : "ok",
+      error_code: data?.error?.code,
+      duration_ms: performance.now() - started,
+    });
+    return data;
   } catch (error) {
-    if (controller?.signal.aborted) throw new Error(`request timed out after ${timeoutMs} ms`);
+    if (controller?.signal.aborted) {
+      diagnostics.record("command_error", {
+        request_id: requestId,
+        command: commandName,
+        error_code: "timeout",
+        duration_ms: performance.now() - started,
+      });
+      throw new Error(`request timed out after ${timeoutMs} ms`);
+    }
+    if (error?.name !== "Error" || !error.message.includes("authentication expired"))
+      diagnostics.record("command_error", {
+        request_id: requestId,
+        command: commandName,
+        error_code: error?.name === "AbortError" ? "aborted" : "fetch_failed",
+        duration_ms: performance.now() - started,
+      });
     throw error;
   } finally {
     if (timer !== null) window.clearTimeout(timer);
@@ -180,6 +217,14 @@ export function recordPerformance(metric, durationMs, { count = 1, bytes = 0 } =
   bucket.max_ms = Math.max(bucket.max_ms, rounded);
   bucket.total_bytes += Number.isFinite(bytes) && bytes > 0 ? Math.ceil(bytes) : 0;
   performanceBuckets.set(metric, bucket);
+  if (rounded >= 2_000)
+    diagnostics.record("slow_performance", {
+      metric,
+      duration_ms: rounded,
+      count,
+      bytes,
+      source: "client",
+    });
   schedulePerformanceFlush();
 }
 
@@ -213,8 +258,10 @@ export async function flushPerformance() {
 
 if (typeof window !== "undefined") {
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) void flushPerformance();
-    else schedulePerformanceFlush();
+    if (document.hidden) {
+      void flushPerformance();
+      void diagnostics.flush();
+    } else schedulePerformanceFlush();
   });
 }
 
@@ -273,6 +320,7 @@ async function connectEventStream() {
     await authenticate();
   } catch {
     eventStreamUnavailable = true;
+    diagnostics.record("ws_connect_error", { reason_code: "authentication_failed" });
     return;
   }
   if (
@@ -281,16 +329,29 @@ async function connectEventStream() {
   )
     return;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  eventSocketRequestId = crypto.randomUUID();
+  const connectStarted = performance.now();
+  diagnostics.record("ws_connect", { request_id: eventSocketRequestId });
   eventSocket = new WebSocket(`${protocol}//${window.location.host}/api/events`);
   eventSocket.onopen = () => {
     eventRetryDelay = 500;
     eventStreamUnavailable = false;
+    eventSocketOpenedAt = performance.now();
+    diagnostics.record("ws_open", {
+      request_id: eventSocketRequestId,
+      duration_ms: eventSocketOpenedAt - connectStarted,
+    });
   };
   eventSocket.onmessage = (message) => {
     if (trafficMonitor.enabled && typeof message.data === "string")
       trafficMonitor.record("events", new TextEncoder().encode(message.data).byteLength);
     try {
       const event = JSON.parse(message.data);
+      if (event.type === "bridge_event_stream" && event.status === "ready")
+        diagnostics.record("event_stream_ready", {
+          request_id: eventSocketRequestId,
+          event_sequence: event.sequence,
+        });
       const observation = eventSequence.observe(event);
       if (!observation.accept) return;
       if (event.type === "bridge_app_server_connection" && event.status === "unavailable") {
@@ -302,21 +363,53 @@ async function connectEventStream() {
       // Ignore malformed event frames; the polling path remains available for recovery.
     }
   };
-  eventSocket.onclose = () => {
+  eventSocket.onclose = (event) => {
     eventSocket = null;
+    diagnostics.record("ws_close", {
+      request_id: eventSocketRequestId,
+      close_code: event.code,
+      duration_ms: eventSocketOpenedAt ? performance.now() - eventSocketOpenedAt : 0,
+    });
+    eventSocketOpenedAt = 0;
     emitEvent({ type: "bridge_event_stream", status: "disconnected" });
     if (!eventStreamUnavailable) {
+      diagnostics.record("ws_retry", {
+        request_id: eventSocketRequestId,
+        retry_delay_ms: eventRetryDelay,
+      });
       eventRetryTimer = setTimeout(connectEventStream, eventRetryDelay);
       eventRetryDelay = Math.min(eventRetryDelay * 2, 10_000);
     }
   };
-  eventSocket.onerror = () => eventSocket?.close();
+  eventSocket.onerror = () => {
+    diagnostics.record("ws_error", { request_id: eventSocketRequestId });
+    eventSocket?.close();
+  };
 }
 
 export function subscribeEvents(listener) {
   eventListeners.add(listener);
   connectEventStream();
   return () => eventListeners.delete(listener);
+}
+
+export function respondToServerRequest(id, result) {
+  if (
+    demoMode ||
+    !Number.isSafeInteger(Number(id)) ||
+    eventSocket?.readyState !== WebSocket.OPEN ||
+    !result ||
+    typeof result !== "object"
+  )
+    return false;
+  eventSocket.send(
+    JSON.stringify({
+      type: "app_server_request_response",
+      id: Number(id),
+      result,
+    }),
+  );
+  return true;
 }
 
 export { demoMode };

@@ -8,17 +8,18 @@ requires `sudo` and does not modify the signed Codex Desktop application.
 | Platform                  | Mode         | App-server                     | User service manager | Adapter          |
 | ------------------------- | ------------ | ------------------------------ | -------------------- | ---------------- |
 | macOS (recommended)       | `standalone` | Separately installed `codex`   | launchd user agent   | Not needed       |
-| Linux                     | `standalone` | Separately installed `codex`   | systemd user service | Not needed       |
+| Linux                     | `standalone` | Separately installed `codex`   | systemd user service | `ws-unix-bridge` |
 | macOS Desktop integration | `desktop`    | Bundled in `ChatGPT.app`       | launchd user agent   | `ws-unix-bridge` |
 
-Standalone is the default recommendation even when ChatGPT/Codex Desktop is installed. It avoids
-App bundle version changes, private runtime configuration, launch-environment interposition, and
-process-lifecycle conflicts. Both app-servers may read the same rollout store; per-session writer
-ownership prevents concurrent writes, and the Web UI exposes an explicit handoff described below.
+Standalone is the default because it uses a separately installed Codex CLI instead of a changing
+App bundle. On Linux the default installer also places `ws-unix-bridge` in front of that one
+app-server. The Web UI connects directly over the Unix socket and Codex Desktop connects through the
+loopback WebSocket adapter, so both clients share one session list, one live event stream, and one
+writer boundary. Either client can send, steer, interrupt, and approve work in the same thread.
 
 The bridge reads its runtime choices from the config file and can supervise the selected
-app-server itself. In macOS desktop mode it can also supervise `ws-unix-bridge` and publish the
-Desktop connection URL. Service definitions therefore start only
+app-server itself. It can also supervise `ws-unix-bridge` and publish the Desktop connection URL.
+Service definitions therefore start only
 `codex-bridge --config /absolute/path/config.toml`; process topology, Web UI, sockets, and runtime
 mode no longer need to be duplicated in launchd or systemd arguments.
 
@@ -28,8 +29,8 @@ Requirements:
 
 - current stable Rust and Cargo;
 - Node.js and npm for the one-time frontend build;
-- macOS and Linux: a standalone `codex` on `PATH` whose `app-server --help` supports a Unix
-  listener;
+- Codex CLI `0.164.0`, the pinned and tested app-server version, on `PATH` with support for
+  `app-server --listen unix://`;
 - optional macOS Desktop mode: `/Applications/ChatGPT.app` with its bundled `codex` executable.
 
 Clone the repository and run the platform installer as the target user:
@@ -58,6 +59,16 @@ loading or enabling services:
 ./scripts/install-linux.sh --web-ui --no-start
 ```
 
+Linux enables the shared Desktop connection by default. Pass `--no-desktop-bridge` only for a
+Web-only deployment. An existing `config.toml` remains authoritative; set
+`services.desktop_interposition = true` explicitly when upgrading an older Web-only config.
+
+For API-key authentication, either export `OPENAI_API_KEY` before installation, pass
+`--api-key-file /absolute/private/key-file`, or keep an API-key provider in the active
+`~/.codex/config.toml`. The file path must be absolute, owned by the current user, and mode `0600`.
+Linux installation persists an exported key in the mode-`0600` user service environment file rather
+than writing it to `config.toml`.
+
 Both scripts:
 
 1. run `npm ci` and build `web-ui/dist`;
@@ -73,6 +84,11 @@ not install or start the Desktop adapter. Both installers detect an existing
 pass `--whisper` when preparing a new installation before enabling that setting. They reuse the
 checkout's shared `target` directory and do not deploy binaries from `target/release`.
 
+`scripts/package-release.sh` builds that same embedded Web UI and the release binaries, then writes
+a versioned tarball under `target/release-package/`. `--publish` uploads it to the GitHub release
+for the current `v<version>` tag. The tag must already point at a clean HEAD. The script does not
+commit, tag, push, install, or restart a running Bridge.
+
 ## Configuration
 
 The default path is `${XDG_CONFIG_HOME:-$HOME/.config}/codex-bridge/config.toml`. Start from
@@ -83,6 +99,7 @@ mode = "standalone" # recommended; desktop is advanced opt-in
 codex_bin = "~/.cargo/bin/codex"
 app_server_socket = "~/.codex-bridge/codex-app-server.sock"
 app_server_thread_cache = 3
+api_key_file = "~/.config/codex-bridge/api-key"
 # projectless_workspace_root = "~/Documents/Codex"
 
 [web_ui]
@@ -108,6 +125,32 @@ ws_bridge_bin = "~/.cargo/bin/ws-unix-bridge"
 [services.app_server_environment]
 HTTPS_PROXY = "http://127.0.0.1:7897"
 HTTP_PROXY = "http://127.0.0.1:7897"
+```
+
+### API-key startup
+
+The Bridge supports three API-key sources without exposing the value:
+
+1. `OPENAI_API_KEY` in the daemon environment; the managed app-server inherits it.
+2. `api_key_file`, a same-user regular file with mode `0600`; Bridge reads it and injects the key
+   only into the managed app-server child.
+3. The active Codex provider in `$CODEX_HOME/config.toml`, including a provider `env_key` whose
+   environment variable is set. The provider can also define the Base URL.
+
+Do not place `OPENAI_API_KEY` under `[services.app_server_environment]`; startup rejects that
+configuration. Settings → Connection & diagnostics reports only whether a key and Base URL are
+configured, their source category, CLI/app-server/schema versions, and the selected writer state.
+It never returns the values.
+
+When `services.manage_app_server = true`, startup fails closed if no API-key source is configured or
+if the CLI version/listener capability differs from the pinned `0.164.0` contract. Set
+`api_key_file`, export `OPENAI_API_KEY` to the daemon, or configure a Codex API-key provider.
+
+The following checks must pass before changing the pinned version:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p codex-bridge --test app_server_compat -- --ignored
+codexctl status
 ```
 
 Paths in the TOML file may be absolute or start with `~/`. Unknown fields and invalid values stop
@@ -294,19 +337,24 @@ feature is a startup error rather than a silently unavailable backend.
 
 ### Web UI security
 
-The normal Web UI configuration requires a mode-`0600` password file. To place the loopback
-listener behind an authenticated same-host proxy, use:
+The normal Web UI configuration requires a mode-`0600` password file. A public reverse proxy must
+retain Bridge authentication; `public_origins` with `no_auth = true` is rejected so Cloudflare
+Access or another proxy cannot become the only authentication layer:
 
 ```toml
 [web_ui]
 enabled = true
 listen = "127.0.0.1:18791"
-no_auth = true
+user = "codex"
+password_file = "~/.codex-bridge/web-ui-password"
+no_auth = false
 public_origins = ["https://codex.example.com"]
 ```
 
-Unauthenticated Web UI startup is rejected on non-loopback addresses. A direct LAN bind should
-retain bridge authentication, and cross-network access should use TLS or a VPN.
+Unauthenticated Web UI startup is rejected on non-loopback addresses. The loopback-only no-auth
+mode remains available for a trusted purely local reverse proxy, but it is not a public deployment
+mode. A direct LAN bind should retain Bridge authentication, and cross-network access should use TLS
+or a VPN.
 
 For direct HTTPS without a reverse proxy, configure a PEM certificate chain and its unencrypted
 PEM private key together:
@@ -398,10 +446,37 @@ launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
 
 ## Linux standalone topology
 
-The Linux installer creates only `~/.config/systemd/user/codex-bridge.service`. The bridge starts
-and supervises the standalone app-server selected by `mode = "standalone"`. There is no Desktop
-WebSocket interception and no `ws-unix-bridge`; both bridge and child run as the logged-in user and
-share the same Codex home directory.
+The Linux installer creates `~/.config/systemd/user/codex-bridge.service`, plus an optional
+mode-`0600` `~/.config/codex-bridge/service.env` when API credentials are exported during install.
+By default it also installs `ws-unix-bridge`, enables
+`services.desktop_interposition = true`, and creates:
+
+- `~/.local/bin/codex-bridge-desktop`
+- `~/.local/share/applications/codex-bridge.desktop`
+
+The Bridge supervises one standalone app-server on a Unix socket. The Web UI connects directly to
+that socket; the Desktop launcher connects to `ws://127.0.0.1:18790/rpc`, which `ws-unix-bridge`
+forwards to the same socket. This is not a second app-server and there is no cross-process writer
+race. Desktop and Web both receive the same thread events and can both send messages or steer.
+The service uses `KillMode=process` so a Bridge restart lets the daemon stop its non-preserved
+children through the supervision channel while the healthy managed app-server remains available.
+
+Codex Desktop must be fully quit before Bridge takes ownership, then reopened through **Codex Bridge
+Desktop**, not the ordinary ChatGPT launcher. The installer refuses to start a managed app-server
+while the bundled Desktop stdio app-server is still running.
+
+Verify the shared topology:
+
+```sh
+systemctl --user show-environment | grep '^CODEX_APP_SERVER_WS_URL='
+lsof -nP -iTCP:18790 -sTCP:LISTEN
+codexctl status
+```
+
+The status page should show the Desktop WS bridge running and Codex GUI connected. In Desktop,
+open a session that is already visible in the Web UI; send once from each client and confirm both
+timelines advance live. If the ordinary ChatGPT launcher is used, Desktop starts its private stdio
+app-server and is intentionally diagnosed as a writer conflict.
 
 Verify or inspect logs with:
 
@@ -419,6 +494,11 @@ systemctl --user restart codex-bridge.service
 
 systemd user services normally start when that user logs in. Running them before login requires
 administrator-controlled lingering policy; the installer intentionally does not change it.
+
+For phone access through Cloudflare Named Tunnel and Access, follow
+[`cloudflare-access.zh-CN.md`](cloudflare-access.zh-CN.md). The companion
+`scripts/install-cloudflared-user.sh` only validates a loopback ingress and installs the user-level
+Tunnel service; it does not create Cloudflare resources.
 
 ## Updating
 
@@ -442,3 +522,27 @@ Confirm the effective startup selection in the service log and check `codexctl s
 
 For command semantics see [`codexctl.md`](codexctl.md). For app-server methods, compatibility, and
 debugging boundaries see [`appserver.md`](appserver.md) and [the debugging guide](../DEBUGGING.md).
+
+### Upgrade preflight and rollback
+
+Before upgrading Codex or Bridge:
+
+```sh
+codexctl status
+systemctl --user status codex-bridge.service
+journalctl --user -u codex-bridge.service -n 100 --no-pager
+```
+
+Check the active-turn and writer fields reported by `codexctl status` and Settings → Connection &
+diagnostics. Do not restart a managed app-server while a turn or queued input is active; the
+explicit restart command performs the same authoritative check and rejects the request.
+
+Keep the previous Bridge binary and the matching `0.164.0` Codex CLI installed until validation is
+complete. To roll back:
+
+1. Stop the Bridge service so it cannot restart the new managed app-server.
+2. Restore the previous Bridge binary and matching Codex CLI.
+3. Restore the matching `config.toml` if schema-related fields changed.
+4. Start Bridge, run `codexctl status`, and complete one loopback login/chat/approval check.
+5. If a Cloudflare Tunnel is enabled, restart its independent user service and verify both Access
+   and Bridge password prompts.

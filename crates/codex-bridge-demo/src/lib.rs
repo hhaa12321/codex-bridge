@@ -838,10 +838,28 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         }
         "status" => json!({
             "service": "codex-bridge-demo",
+            "bridge_version": env!("CARGO_PKG_VERSION"),
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 35,
+            "protocol_version": 45,
+            "codex_compatibility": {
+                "pinned_version": "0.164.0",
+                "cli_version": "0.164.0",
+                "unix_listener_supported": true,
+                "error": null
+            },
+            "api_key": {
+                "configured": true,
+                "source": "codex_config",
+                "base_url_configured": true
+            },
+            "public_origin": null,
+            "upgrade_preflight": {
+                "active_turns": 0,
+                "selected_thread_id": PRIMARY_THREAD,
+                "selected_writer": {"state": "owned", "read_only": false, "reason": null}
+            },
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -865,7 +883,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             },
             "rollout_store": {"available": true, "codex_home": "/demo/.codex", "read_only": true},
             "selected_thread_id": PRIMARY_THREAD,
-            "write_backend": {"app_server_available": true, "app_server_mode": "demo_wasm", "standalone_fallback": false}
+            "write_backend": {"app_server_available": true, "app_server_mode": "demo_wasm", "standalone_fallback": false, "schema_version": "0.164.0", "runtime_version": "0.164.0-demo", "runtime_kind": "demo", "runtime_user_agent": "Codex Bridge demo WASM"}
         }),
         "ls" => {
             let mut threads = vec![state.thread(PRIMARY_THREAD), state.thread(SECONDARY_THREAD)];
@@ -1270,6 +1288,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "thread_id": thread_id,
             "model": state.model,
             "reasoning_effort": state.effort,
+            "weekly_usage_supported": true,
             "weekly_usage": {"remaining_percent": 63, "resets_at": 1_790_000_000_u64}
         }),
         "composer_options" => models(),
@@ -1419,7 +1438,6 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         "tail" => {
             json!({"source": "demo_wasm", "messages": state.messages.iter().cloned().map(public_message).collect::<Vec<_>>(), "messages_total": state.messages.len()})
         }
-        "pending" => json!({"requests": []}),
         "scroll" => json!({"status": "simulated", "direction": request.get("direction")}),
         "message_content" => {
             return error(
@@ -1430,8 +1448,6 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         "thread_create"
         | "thread_archive"
         | "thread_repair_ordinals"
-        | "approve"
-        | "decline"
         | "host_exec"
         | "app_server_rpc" => {
             return error(
@@ -1520,7 +1536,12 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 35);
+        assert_eq!(response["result"]["protocol_version"], 45);
+        assert_eq!(
+            response["result"]["codex_compatibility"]["pinned_version"],
+            "0.164.0"
+        );
+        assert_eq!(response["result"]["api_key"]["source"], "codex_config");
     }
 
     #[test]

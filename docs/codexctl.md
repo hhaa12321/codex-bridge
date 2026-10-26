@@ -55,10 +55,11 @@ focus.
 | `host-exec`           | Run an allowlisted host command in the task workspace  | Implemented          |
 | `tail`                | Stream new task items                                  | Protocol placeholder |
 | `scroll`              | Control the Desktop message view                       | Protocol placeholder |
-| `pending`             | List approval requests                                 | Protocol placeholder |
-| `approve` / `decline` | Resolve an approval                                    | Protocol placeholder |
 
 Placeholders return `not_implemented`; they do not report a successful no-op.
+Approval and clarification requests are resolved by the authenticated Web UI event stream, where the
+live app-server request and all available decisions are visible. `codexctl` deliberately has no
+one-shot approval command.
 
 View the exact options installed on the current machine:
 

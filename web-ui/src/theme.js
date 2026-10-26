@@ -32,6 +32,11 @@ export function applyTheme(theme, persist = true) {
     resolved = resolveTheme(preference, Boolean(systemThemeMedia()?.matches));
   document.documentElement.dataset.themePreference = preference;
   document.documentElement.dataset.theme = resolved;
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) themeColor.setAttribute("content", resolved === "dark" ? "#101214" : "#f8f9fa");
+  document
+    .getElementById("themeQuickToggle")
+    ?.setAttribute("aria-pressed", String(resolved === "dark"));
   if (persist) {
     try {
       localStorage.setItem(THEME_STORAGE_KEY, preference);

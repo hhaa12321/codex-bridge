@@ -2,4 +2,4 @@
 //!
 //! Update this value together with the generated-schema audit and protocol compatibility tests.
 
-pub const APP_SERVER_SCHEMA_VERSION: &str = "0.152.1";
+pub const APP_SERVER_SCHEMA_VERSION: &str = "0.164.0";

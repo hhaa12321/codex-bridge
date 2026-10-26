@@ -27,6 +27,17 @@ const APP_SERVER_EVENT_CAPACITY: usize = 512;
 const APP_SERVER_MAX_MESSAGE_BYTES: usize = 64 << 20;
 const REALTIME_TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn replays_server_request(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "applyPatchApproval"
+            | "execCommandApproval"
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexCliBackend {
     program: PathBuf,
@@ -63,6 +74,11 @@ enum AppServerCommand {
         thread_id: String,
         response: std_mpsc::SyncSender<Result<Value, BackendFailure>>,
     },
+    Respond {
+        request_id: u64,
+        result: Value,
+        response: std_mpsc::SyncSender<Result<Value, BackendFailure>>,
+    },
     ForgetThread {
         thread_id: String,
     },
@@ -80,6 +96,7 @@ struct AppServerSession {
 struct AppServerEventBus {
     sender: broadcast::Sender<Value>,
     sequence: AtomicU64,
+    pending_requests: RwLock<HashMap<u64, Value>>,
 }
 
 impl AppServerEventBus {
@@ -88,6 +105,7 @@ impl AppServerEventBus {
         Self {
             sender,
             sequence: AtomicU64::new(0),
+            pending_requests: RwLock::new(HashMap::new()),
         }
     }
 
@@ -97,6 +115,27 @@ impl AppServerEventBus {
 
     fn current_sequence(&self) -> u64 {
         self.sequence.load(Ordering::Acquire)
+    }
+
+    fn pending_server_requests(&self) -> Vec<Value> {
+        let mut requests = self
+            .pending_requests
+            .read()
+            .map(|requests| {
+                requests
+                    .iter()
+                    .map(|(id, request)| (*id, request.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        requests.sort_by_key(|(id, _)| *id);
+        requests.into_iter().map(|(_, request)| request).collect()
+    }
+
+    fn remove_server_request(&self, request_id: u64) {
+        if let Ok(mut requests) = self.pending_requests.write() {
+            requests.remove(&request_id);
+        }
     }
 
     fn publish(&self, mut event: Value) -> bool {
@@ -346,10 +385,29 @@ impl CodexCliBackend {
             .map(|session| session.events.current_sequence())
     }
 
+    pub fn pending_app_server_requests(&self) -> Vec<Value> {
+        self.app_server
+            .as_ref()
+            .map(|session| session.events.pending_server_requests())
+            .unwrap_or_default()
+    }
+
     pub fn publish_bridge_event(&self, event: Value) -> bool {
         self.app_server
             .as_ref()
             .is_some_and(|session| session.events.publish(event))
+    }
+
+    pub fn respond_to_app_server_request(
+        &self,
+        request_id: u64,
+        result: Value,
+    ) -> Result<Value, BackendFailure> {
+        let app_server = self
+            .app_server
+            .as_ref()
+            .ok_or_else(app_server_unavailable)?;
+        app_server.respond(request_id, result)
     }
 
     pub fn app_server_runtime_info(&self) -> Option<AppServerRuntimeInfo> {
@@ -730,6 +788,28 @@ impl AppServerSession {
                 message: "app-server connection worker stopped".to_owned(),
             })
     }
+
+    fn respond(&self, request_id: u64, result: Value) -> Result<Value, BackendFailure> {
+        let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(AppServerCommand::Respond {
+                request_id,
+                result,
+                response: response_tx,
+            })
+            .map_err(|_| BackendFailure {
+                code: "app_server_unavailable",
+                message: "app-server connection worker stopped".to_owned(),
+            })?;
+        let response = response_rx
+            .recv_timeout(RPC_TIMEOUT + Duration::from_secs(2))
+            .map_err(|error| BackendFailure {
+                code: "app_server_timeout",
+                message: format!("failed waiting for app-server request response: {error}"),
+            })??;
+        self.events.remove_server_request(request_id);
+        Ok(response)
+    }
 }
 
 fn app_server_worker(
@@ -763,7 +843,8 @@ fn app_server_worker(
                     match command {
                         AppServerCommand::Rpc { response, .. }
                         | AppServerCommand::WatchThread { response, .. }
-                        | AppServerCommand::ReleaseThread { response, .. } => {
+                        | AppServerCommand::ReleaseThread { response, .. }
+                        | AppServerCommand::Respond { response, .. } => {
                             let _ = response.send(Err(error));
                         }
                         AppServerCommand::ForgetThread { .. } => unreachable!(),
@@ -911,6 +992,22 @@ fn app_server_worker(
                             emit_connection_event(&events, &runtime, "disconnected", None, None);
                         }
                         let _ = response.send(result);
+                    }
+                    AppServerCommand::Respond {
+                        request_id,
+                        result,
+                        response,
+                    } => {
+                        let write = write_rpc_message(
+                            websocket.as_mut().expect("connection ensured"),
+                            &json!({"id": request_id, "result": result}),
+                        );
+                        if write.is_err() {
+                            websocket = None;
+                            emit_connection_event(&events, &runtime, "disconnected", None, None);
+                        }
+                        let _ = response
+                            .send(write.map(|()| json!({"request_id": request_id, "sent": true})));
                     }
                     AppServerCommand::ForgetThread { .. } => unreachable!(),
                 }
@@ -1153,6 +1250,19 @@ fn read_app_server_message(
         message: format!("app-server returned invalid JSON: {error}"),
     })?;
     if value.get("method").is_some() {
+        let method = value.get("method").and_then(Value::as_str);
+        if method == Some("serverRequest/resolved") {
+            if let Some(request_id) = value.pointer("/params/requestId").and_then(Value::as_u64) {
+                events.remove_server_request(request_id);
+            }
+        } else if method.is_some_and(replays_server_request) {
+            let Some(request_id) = value.get("id").and_then(Value::as_u64) else {
+                return Ok(None);
+            };
+            if let Ok(mut requests) = events.pending_requests.write() {
+                requests.insert(request_id, value.clone());
+            }
+        }
         let event_type = if value.get("id").is_some() {
             "app_server_request"
         } else {
@@ -1413,6 +1523,78 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.code, "app_server_unavailable");
         assert!(failure.message.contains("standalone fallback is disabled"));
+    }
+
+    #[test]
+    fn server_request_response_is_written_to_the_shared_websocket() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "cb-request-response-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {"userAgent": "codex-cli/0.164.0"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let request = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": 7,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thread-1", "command": ["printf", "ok"]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({"id": request["id"], "result": {"data": []}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let response = read_json(&mut websocket);
+            (request, response)
+        });
+
+        let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path));
+        let mut events = backend.subscribe_app_server_events().unwrap();
+        backend
+            .app_server_rpc("thread/list", json!({"limit": 1}))
+            .unwrap();
+        let request_event = (0..3).find_map(|_| {
+            events.try_recv().ok().filter(|event| {
+                event.get("type") == Some(&json!("app_server_request"))
+                    && event.pointer("/message/id") == Some(&json!(7))
+            })
+        });
+        assert!(request_event.is_some());
+        let pending = backend.pending_app_server_requests();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["id"], 7);
+        let receipt = backend
+            .respond_to_app_server_request(7, json!({"decision": "accept"}))
+            .unwrap();
+        assert_eq!(receipt["request_id"], 7);
+        assert!(backend.pending_app_server_requests().is_empty());
+
+        let (_request, response) = server.join().unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"]["decision"], "accept");
+        std::fs::remove_dir_all(sock_dir).unwrap();
     }
 
     #[test]

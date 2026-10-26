@@ -144,12 +144,6 @@ enum Command {
     },
     /// Scroll the Codex conversation UI.
     Scroll(ScrollArgs),
-    /// List pending approval requests.
-    Pending,
-    /// Approve a pending request.
-    Approve { id: u64 },
-    /// Decline a pending request.
-    Decline { id: u64 },
     /// Interrupt the active turn through the shared app-server.
     Interrupt {
         /// Emit structured JSON.
@@ -405,18 +399,6 @@ impl Command {
                     false,
                     OutputKind::Generic,
                 ))
-            }
-            Self::Pending => {
-                reject_target(&target_thread, "pending")?;
-                Ok((Request::Pending, false, OutputKind::Generic))
-            }
-            Self::Approve { id } => {
-                reject_target(&target_thread, "approve")?;
-                Ok((Request::Approve { id }, false, OutputKind::Generic))
-            }
-            Self::Decline { id } => {
-                reject_target(&target_thread, "decline")?;
-                Ok((Request::Decline { id }, false, OutputKind::Generic))
             }
             Self::Interrupt { json } => Ok((
                 Request::Interrupt {

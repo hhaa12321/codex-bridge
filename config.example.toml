@@ -8,14 +8,18 @@ mode = "standalone"
 # Generated Chat workspaces default to ~/Documents/Codex/YYYY-MM-DD/<prompt-slug>.
 # projectless_workspace_root = "~/Documents/Codex"
 # codex_bin = "/absolute/path/to/codex"
+# Required for managed API-key startup unless OPENAI_API_KEY is already in the
+# process environment or the active Codex model provider has an API-key
+# credential. The file must be owned by this user and mode 0600.
+# api_key_file = "~/.config/codex-bridge/api-key"
 # app_server_socket = "~/.codex-bridge/app-server.sock"
 app_server_thread_cache = 3
 # host_exec_policy = "~/.config/codex-bridge/host-exec-policy.json"
 
 [web_ui]
-enabled = false
+enabled = true
 # Optional browser title and top-left brand label.
-name = "Codex App Server WebUI"
+name = "Codex Bridge"
 listen = "127.0.0.1:18791"
 user = "codex"
 # password_file = "~/.codex-bridge/web-ui-password"
@@ -23,7 +27,9 @@ user = "codex"
 # tls_cert_file = "~/.config/codex-bridge/tls/fullchain.pem"
 # tls_private_key_file = "~/.config/codex-bridge/tls/private-key.pem"
 no_auth = false
-public_origins = []
+# Required when using a reverse proxy. Use the exact public origin, including
+# the Cloudflare Access hostname and no path.
+# public_origins = ["https://codex.example.com"]
 # Additional directories whose files may be previewed and downloaded from any session.
 # Use absolute paths or ~/ paths; symlinks outside these directories remain blocked.
 # visible_directories = ["~/projects"]
@@ -31,18 +37,21 @@ public_origins = []
 [services]
 # When enabled, codex-bridge starts or adopts and restarts `codex app-server`.
 # The app-server stays alive while codex-bridge itself is upgraded or restarted.
-manage_app_server = false
-# Desktop mode can also supervise ws-unix-bridge and publish the launchd URL.
+manage_app_server = true
+# Supervise ws-unix-bridge so Codex Desktop and the Web UI use the same
+# app-server connection boundary. On Linux, launch Desktop with the generated
+# CODEX_APP_SERVER_WS_URL or the installer's Desktop launcher.
 # With both options enabled, the managed app-server receives a disabled
 # `mcp_servers.codex_app` base entry so Desktop can send its incremental tool list.
 # An external process manager must pass the same `-c` override documented in docs/install.md.
-desktop_interposition = false
+desktop_interposition = true
 ws_bridge_listen = "127.0.0.1:18790"
 # ws_bridge_bin = "~/.cargo/bin/ws-unix-bridge"
 # Optional environment passed only to the managed app-server child.
 # [services.app_server_environment]
 # HTTPS_PROXY = "http://127.0.0.1:7897"
 # HTTP_PROXY = "http://127.0.0.1:7897"
+# Do not put OPENAI_API_KEY here. Use api_key_file or the daemon environment.
 
 # Optional local speech-to-text fallback. This requires a codex-bridge binary
 # built with `--features whisper`. The daemon starts whisper-server only while

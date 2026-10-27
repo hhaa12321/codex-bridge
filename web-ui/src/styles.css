@@ -34,6 +34,7 @@
   --action: #f1f3f5;
   --action-text: #101214;
 }
+
 * {
   box-sizing: border-box;
 }
@@ -6145,5 +6146,36 @@ html[data-theme="light"] {
   .composer-shell #submitBtn .submit-arrow,
   .composer-shell #temporarySendBtn .submit-arrow {
     stroke: var(--bg);
+  }
+}
+
+button.icon-button {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-radius: 8px;
+}
+
+button.icon-button .desktop-icon {
+  width: 17px;
+  height: 17px;
+  fill: none;
+}
+
+@media screen and (max-width: 800px) {
+  button.icon-button {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    min-height: 44px;
+  }
+
+  .settings-head {
+    grid-template-columns: 44px minmax(0, 1fr) 44px;
   }
 }

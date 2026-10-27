@@ -4398,7 +4398,17 @@ async function showToolGroupSummary(threadId, messageIndex) {
   header.className = "tool-summary-dialog-header";
   title.textContent = tr("toolGroupSummary");
   close.type = "button";
-  close.textContent = tr("close");
+  close.className = "icon-button";
+  close.title = tr("close");
+  close.setAttribute("aria-label", tr("close"));
+  const closeIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  closeIcon.classList.add("desktop-icon");
+  closeIcon.setAttribute("aria-hidden", "true");
+  closeIcon.setAttribute("viewBox", "0 0 24 24");
+  const closePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  closePath.setAttribute("d", "M18 6 6 18M6 6l12 12");
+  closeIcon.append(closePath);
+  close.append(closeIcon);
   close.onclick = () => dialog.close();
   body.className = "tool-summary-dialog-body";
   body.textContent = tr("toolGroupSummarizing");
@@ -8875,7 +8885,7 @@ document.querySelectorAll(".nav-toggle").forEach(
     }),
 );
 $("scrim").onclick = closePanels;
-applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
+applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "zh", false);
 initSettingsPanel();
 initPasskeySettings(demoMode);
 renderUsageWindows();

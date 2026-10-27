@@ -15020,7 +15020,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "id=\"usageHealth\"",
             "服务异常 · 等待恢复",
             "Desktop bundled app-server · private transport",
-            "standalone fallback 已禁用",
+            "桌面端内置应用服务端使用私有连接；独立回退模式已禁用",
             "-webkit-text-size-adjust: 100%",
             "contain: inline-size",
             "id=\"modelPicker\"",

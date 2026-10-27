@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta
@@ -169,25 +169,31 @@
           <header class="settings-head">
             <button
               id="settingsBackBtn"
-              class="settings-back"
+              class="settings-back icon-button"
               type="button"
               data-i18n-aria-label="settingsBack"
+              data-i18n-title="settingsBack"
               aria-label="Categories"
             >
-              ‹
+              <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="m15 18-6-6 6-6" />
+              </svg>
             </button>
             <h2 id="settingsTitle" data-i18n="settings">Settings</h2>
             <button
               id="settingsCloseBtn"
-              class="settings-close"
+              class="settings-close icon-button"
               type="button"
               data-i18n-aria-label="close"
+              data-i18n-title="close"
               aria-label="Close"
             >
-              ×
+              <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
             </button>
           </header>
-          <nav class="settings-nav" aria-label="Settings">
+          <nav class="settings-nav" aria-label="Settings" data-i18n-aria-label="settings">
             <button type="button" data-settings-nav="general" data-i18n="settingsGeneral">
               General
             </button>
@@ -224,13 +230,27 @@
                     <div>
                       <button
                         id="diagnosticsRefreshBtn"
+                        class="icon-button"
                         type="button"
-                        data-i18n="refreshDiagnostics"
+                        data-i18n-aria-label="refreshDiagnostics"
+                        data-i18n-title="refreshDiagnostics"
+                        aria-label="Refresh"
                       >
-                        Refresh
+                        <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                          <path d="M20 11a8 8 0 1 0-2.3 6.7M20 4v7h-7" />
+                        </svg>
                       </button>
-                      <button id="diagnosticsExportBtn" type="button" data-i18n="exportDiagnostics">
-                        Export
+                      <button
+                        id="diagnosticsExportBtn"
+                        class="icon-button"
+                        type="button"
+                        data-i18n-aria-label="exportDiagnostics"
+                        data-i18n-title="exportDiagnostics"
+                        aria-label="Export"
+                      >
+                        <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                          <path d="M12 3v12m-5-5 5 5 5-5M5 19h14" />
+                        </svg>
                       </button>
                     </div>
                   </div>
@@ -424,7 +444,17 @@
                 <path d="M8 3v5H3M16 3v5h5M21 16h-5v5M3 16h5v5" />
               </svg>
               <span class="mobile-button-label" data-i18n="fullscreenShort">Full</span></button
-            ><button id="refreshBtn" data-i18n="refresh">Refresh</button
+            ><button
+              id="refreshBtn"
+              class="icon-button"
+              type="button"
+              data-i18n-aria-label="refresh"
+              data-i18n-title="refresh"
+              aria-label="Refresh"
+            >
+              <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M20 11a8 8 0 1 0-2.3 6.7M20 4v7h-7" />
+              </svg></button
             ><button
               class="temporary-toggle"
               id="temporaryPanelBtn"
@@ -496,7 +526,18 @@
           <div class="model-picker" id="modelPicker" hidden>
             <div class="model-picker-head">
               <span data-i18n="modelAndEffort">Model and reasoning effort</span
-              ><button id="modelPickerClose" type="button" data-i18n="close">Close</button>
+              ><button
+                id="modelPickerClose"
+                class="icon-button"
+                type="button"
+                data-i18n-aria-label="close"
+                data-i18n-title="close"
+                aria-label="Close"
+              >
+                <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
             </div>
             <label for="modelSelect" data-i18n="model">Model</label
             ><select id="modelSelect"></select
@@ -671,7 +712,18 @@
               <button id="sessionRefreshBtn" type="button" data-i18n="refreshSession">
                 Refresh session
               </button>
-              <button class="tool-toggle" data-i18n="close">Close</button>
+              <button
+                id="toolsCloseBtn"
+                class="tool-toggle icon-button"
+                type="button"
+                data-i18n-aria-label="close"
+                data-i18n-title="close"
+                aria-label="Close"
+              >
+                <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
             </div>
           </div>
           <div class="tool-row">
@@ -892,7 +944,19 @@
       Question
     </button>
     <div class="selection-actions" id="selectionActions" role="toolbar" hidden>
-      <button id="selectionCopyBtn" type="button" data-i18n="copy">Copy</button>
+      <button
+        id="selectionCopyBtn"
+        class="icon-button"
+        type="button"
+        data-i18n-aria-label="copy"
+        data-i18n-title="copy"
+        aria-label="Copy"
+      >
+        <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+          <rect x="9" y="9" width="11" height="11" rx="2" />
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+        </svg>
+      </button>
       <button id="selectionInsertBtn" type="button" data-i18n="insertConversation">Insert</button>
       <button id="selectionTemporaryBtn" type="button" data-i18n="temporaryShort">Temp</button>
     </div>
@@ -953,8 +1017,17 @@
               >
             </button>
           </div>
-          <button class="create-back" id="createProjectBackBtn" type="button" data-i18n="back">
-            Back
+          <button
+            class="create-back icon-button"
+            id="createProjectBackBtn"
+            type="button"
+            data-i18n-aria-label="back"
+            data-i18n-title="back"
+            aria-label="Back"
+          >
+            <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m12 19-7-7 7-7M19 12H5" />
+            </svg>
           </button>
         </div>
         <div class="create-actions">
@@ -1008,7 +1081,18 @@
       <section class="tasks-card">
         <header class="tasks-head">
           <h2 id="tasksTitle" data-i18n="activeTasks">Active tasks</h2>
-          <button id="tasksCloseBtn" type="button" data-i18n="close">Close</button>
+          <button
+            id="tasksCloseBtn"
+            class="icon-button"
+            type="button"
+            data-i18n-aria-label="close"
+            data-i18n-title="close"
+            aria-label="Close"
+          >
+            <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
         </header>
         <div class="tasks-list" id="tasksList"></div>
       </section>
@@ -1029,8 +1113,30 @@
           </div>
           <div class="file-preview-actions">
             <button id="filePreviewMode" type="button" hidden></button>
-            <button id="filePreviewDownload" type="button" data-i18n="download">Download</button>
-            <button id="filePreviewClose" type="button" data-i18n="close">Close</button>
+            <button
+              id="filePreviewDownload"
+              class="icon-button"
+              type="button"
+              data-i18n-aria-label="download"
+              data-i18n-title="download"
+              aria-label="Download"
+            >
+              <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M12 3v12m-5-5 5 5 5-5M5 19h14" />
+              </svg>
+            </button>
+            <button
+              id="filePreviewClose"
+              class="icon-button"
+              type="button"
+              data-i18n-aria-label="close"
+              data-i18n-title="close"
+              aria-label="Close"
+            >
+              <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
           </div>
         </header>
         <div class="file-preview-body" id="filePreviewBody"></div>

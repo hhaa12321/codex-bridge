@@ -1202,6 +1202,57 @@ test("chat history header toggles a composer-free full-screen reading mode", asy
   assert.match(source, /else if \(isHistoryFullscreen\(\)\) setHistoryFullscreen\(false\)/);
 });
 
+test("the UI defaults to Chinese and uses accessible icon actions", async () => {
+  const [index, source, translations, stylesheet] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+    readFile(new URL("../src/i18n.js", import.meta.url), "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+
+  assert.match(index, /<html lang="zh-CN">/);
+  assert.match(translations, /let language = "zh";/);
+  assert.match(translations, /languageSwitch: "切换到英文"/);
+  assert.match(translations, /querySelectorAll\("\[data-i18n-title\]"\)/);
+  assert.match(
+    source,
+    /applyLanguage\(localStorage\.getItem\(LANGUAGE_STORAGE_KEY\) \|\| "zh", false\)/,
+  );
+  assert.match(source, /applyLanguage\(getLanguage\(\) === "en" \? "zh" : "en"\)/);
+
+  for (const id of [
+    "settingsBackBtn",
+    "settingsCloseBtn",
+    "diagnosticsRefreshBtn",
+    "diagnosticsExportBtn",
+    "refreshBtn",
+    "modelPickerClose",
+    "toolsCloseBtn",
+    "selectionCopyBtn",
+    "createProjectBackBtn",
+    "tasksCloseBtn",
+    "filePreviewDownload",
+    "filePreviewClose",
+  ]) {
+    const button = index.match(
+      new RegExp(`<button[^>]*\\bid="${id}"[^>]*>[\\s\\S]*?</button>`),
+    )?.[0];
+    assert.ok(button, `${id} should be a button`);
+    assert.match(button, /class="[^"]*\bicon-button\b/, id);
+    assert.match(button, /data-i18n-aria-label="[^"]+"/, id);
+    assert.match(button, /data-i18n-title="[^"]+"/, id);
+    assert.match(button, /<svg class="desktop-icon" aria-hidden="true"/, id);
+  }
+
+  assert.match(stylesheet, /button\.icon-button\s*\{[\s\S]*?width: 32px;[\s\S]*?height: 32px;/);
+  assert.match(
+    stylesheet,
+    /@media screen and \(max-width: 800px\)\s*\{[\s\S]*?button\.icon-button\s*\{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/,
+  );
+  assert.match(source, /close\.className = "icon-button"/);
+  assert.match(source, /close\.setAttribute\("aria-label", tr\("close"\)\)/);
+});
+
 test("browser performance samples use the bounded demo protocol", async () => {
   const command = await demoClient();
   const response = result(
@@ -2761,8 +2812,8 @@ test("session writer ownership drives read-only UI and explicit release", async 
   );
   assert.match(source, /queueOnlyPlaceholder/);
   assert.match(stylesheet, /\.composer-shell\.read-only/);
-  assert.match(translations, /sessionInUse:\s*"会话已被其他 app-server 使用 · 只读"/);
-  assert.match(translations, /queueWithoutLockAria:\s*"加入 queue，不获取会话锁"/);
+  assert.match(translations, /sessionInUse:\s*"会话已被其他应用服务端使用 · 只读"/);
+  assert.match(translations, /queueWithoutLockAria:\s*"加入队列，不获取会话锁"/);
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {

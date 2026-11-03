@@ -3517,16 +3517,25 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketStat
     }
     let mut connected = 0;
     let mut refused = 0;
+    let mut unexpected_error: Option<std::io::Error> = None;
     for attempt in 0..3 {
-        if UnixStream::connect(path).await.is_ok() {
-            connected += 1;
-            if connected == 2 {
-                return Ok(ManagedSocketState::Active);
+        match UnixStream::connect(path).await {
+            Ok(_) => {
+                connected += 1;
+                if connected == 2 {
+                    return Ok(ManagedSocketState::Active);
+                }
             }
-        } else {
-            refused += 1;
-            if refused == 2 {
-                break;
+            Err(error) => {
+                if error.kind() == ErrorKind::ConnectionRefused {
+                    refused += 1;
+                    if refused == 2 {
+                        break;
+                    }
+                } else {
+                    unexpected_error = Some(error);
+                    break;
+                }
             }
         }
         if attempt < 2 {
@@ -3534,10 +3543,28 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketStat
         }
     }
     if is_symlink {
-        bail!(
-            "refusing to remove inactive managed socket symlink {}",
+        if let Some(error) = unexpected_error {
+            bail!(
+                "refusing to remove managed socket symlink {} after unexpected connect error: {error}",
+                path.display()
+            );
+        }
+        // The symlink survived but its target refuses every connection: no process is
+        // listening on it. This is left behind when a previous managed app-server was
+        // killed mid-startup, and it used to make every later start fail forever. Remove
+        // only the symlink; the target socket file belongs to the app-server, which
+        // reclaims or reuses it on the next spawn.
+        eprintln!(
+            "[codex-bridge] removing stale managed socket symlink {} (target is not listening)",
             path.display()
         );
+        fs::remove_file(path).with_context(|| {
+            format!(
+                "failed to remove stale managed socket symlink {}",
+                path.display()
+            )
+        })?;
+        return Ok(ManagedSocketState::Vacant);
     }
     fs::remove_file(path)
         .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
@@ -14047,17 +14074,21 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             ManagedSocketState::Active
         );
         drop(target_listener);
-        let error = prepare_managed_process_socket(&linked_socket)
-            .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("refusing to remove inactive managed socket symlink"));
-        assert!(fs::symlink_metadata(&linked_socket)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        fs::remove_file(linked_socket).unwrap();
+        // The target socket file still exists but nothing listens on it anymore. The
+        // symlink must be removed so the next managed start can bind the real socket
+        // again instead of failing forever, while the target itself is left alone: it
+        // belongs to the app-server, which reclaims it on the next spawn.
+        assert_eq!(
+            prepare_managed_process_socket(&linked_socket)
+                .await
+                .unwrap(),
+            ManagedSocketState::Vacant
+        );
+        assert_eq!(
+            fs::symlink_metadata(&linked_socket).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert!(target_socket.exists());
         fs::remove_file(target_socket).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -14933,13 +14964,17 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(WEB_INDEX.contains("name=\"theme-color\""));
         assert!(WEB_INDEX.contains("/assets/app.js?v="));
         assert!(WEB_INDEX.contains("/assets/app.css?v="));
+        assert!(WEB_INDEX.contains("id=\"pwaUpdateDialog\""));
         assert!(WEB_MANIFEST.contains("\"display\": \"standalone\""));
+        assert!(WEB_MANIFEST.contains("\"orientation\": \"portrait\""));
         assert!(WEB_MANIFEST.contains("\"id\": \"/\""));
         assert!(WEB_MANIFEST.contains("\"scope\": \"/\""));
         assert!(WEB_MANIFEST.contains("192x192"));
         assert!(WEB_MANIFEST.contains("maskable"));
         assert!(WEB_SERVICE_WORKER.contains("addEventListener(\"fetch\""));
+        assert!(WEB_SERVICE_WORKER.contains("addEventListener(\"message\""));
         assert!(WEB_SERVICE_WORKER.contains("self.skipWaiting()"));
+        assert!(WEB_SERVICE_WORKER.contains("event.data?.type === \"SKIP_WAITING\""));
         assert!(WEB_SERVICE_WORKER.contains("const PRECACHE"));
         assert!(WEB_SERVICE_WORKER.contains("const OFFLINE_URL = \"/offline.html\""));
         assert!(WEB_SERVICE_WORKER.contains("request.mode === \"navigate\""));

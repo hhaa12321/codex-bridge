@@ -121,6 +121,11 @@ cloudflared tunnel --config ~/.config/cloudflared/config.yml ingress validate
    改写或剥离 `/api/events`。
 5. 保存后从未登录的隐私窗口访问公网主机名，应先看到 Cloudflare Access，而不是 Bridge 登录页。
 
+Chrome 获取 PWA manifest 时不保证携带 Access Cookie。另建一个只匹配
+`codex.example.com/manifest.webmanifest` 的 Self-hosted application，并为 `Everyone` 添加 `Bypass`
+policy。Access 对重叠路径使用更具体的 application，且不会从根路径策略继承权限。只绕过这一条
+manifest 路径；`/`、`/sw.js`、`/offline.html`、认证与 API 路径必须继续经过 Access 和 Bridge 认证。
+
 通过 Access 后仍会看到 Bridge 登录页；输入 Bridge 用户名和密码后才能进入聊天工作区。这是预期的
 双层认证。
 
@@ -142,6 +147,8 @@ cloudflared tunnel --config ~/.config/cloudflared/config.yml ingress validate
 从 Cloudflare 外部网络检查时：
 
 - 不带 Access 身份访问应被 Cloudflare 拒绝或重定向到 Access，而不是返回 Bridge HTML。
+- 唯一例外是 `manifest.webmanifest`：匿名请求应返回 `200` 和 `application/manifest+json`，且响应
+  不包含用户数据。`/sw.js`、`/offline.html`、认证、API 与用户内容仍必须要求 Access。
 - 直接扫描服务器公网 IP 不应发现 `18791` 或 app-server 管理端口。
 - `cloudflared` 进程应只建立出站连接，不新增监听在 `0.0.0.0` 的服务。
 - 响应头和页面不应包含 API Key、Bridge Cookie、app-server Unix socket 或完整本机目录。

@@ -1,4 +1,5 @@
 import { createAuthenticationGate } from "./auth-gate.js";
+import { authenticationNeedsNavigation } from "./auth-response.js";
 import { diagnostics } from "./client-diagnostics.js";
 import { createEventSequenceTracker } from "./event-sequence.js";
 import { sendFileUpload } from "./file-upload.js";
@@ -69,9 +70,14 @@ const authentication = createAuthenticationGate(async () => {
     {
       credentials: "same-origin",
       cache: "no-store",
+      redirect: "manual",
     },
     15_000,
   );
+  if (authenticationNeedsNavigation(response)) {
+    window.location.reload();
+    return new Promise(() => {});
+  }
   if (!response.ok) {
     if (trafficMonitor.enabled) await monitoredText(response, "auth");
     throw new Error(`authentication failed (${response.status})`);
@@ -80,6 +86,8 @@ const authentication = createAuthenticationGate(async () => {
 });
 
 export const authenticate = () => authentication.wait();
+
+export const reauthenticate = () => authentication.refresh();
 
 export async function createFileDownloadTicket(threadId, path) {
   await authenticate();

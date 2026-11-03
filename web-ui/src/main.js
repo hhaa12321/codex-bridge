@@ -5,6 +5,7 @@ import {
   command,
   demoMode,
   notify,
+  reauthenticate,
   recordPerformance,
   requestFilePreview,
   respondToServerRequest,
@@ -74,6 +75,7 @@ import { trafficMonitor } from "./traffic-monitor.js";
 import { weeklyUsageBuckets } from "./weekly-usage-chart.js";
 import { initPasskeySettings } from "./passkey-settings.js";
 import { registerServiceWorker } from "./pwa.js";
+import { showPwaUpdatePrompt } from "./pwa-update-prompt.js";
 import { initSettingsPanel } from "./settings-panel.js";
 import {
   rememberSessionId,
@@ -8650,6 +8652,9 @@ const refreshAfterResume = () => {
 };
 document.addEventListener("visibilitychange", refreshAfterResume);
 document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") reauthenticate().catch(() => {});
+});
+document.addEventListener("visibilitychange", () => {
   syncRunningToolDurationTimer();
   scheduleActivityFallback();
   schedulePendingFallback(true);
@@ -8885,13 +8890,26 @@ document.querySelectorAll(".nav-toggle").forEach(
     }),
 );
 $("scrim").onclick = closePanels;
+
+function offerPwaUpdate({ apply }) {
+  showPwaUpdatePrompt({
+    dialog: $("pwaUpdateDialog"),
+    error: $("pwaUpdateError"),
+    laterButton: $("pwaUpdateLaterBtn"),
+    updateButton: $("pwaUpdateNowBtn"),
+    apply,
+    reload: () => window.location.reload(),
+    translate: tr,
+  });
+}
+
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "zh", false);
 initSettingsPanel();
 initPasskeySettings(demoMode);
 renderUsageWindows();
 renderWeeklyHistory();
 renderBrowserNotifications();
-registerServiceWorker();
+registerServiceWorker({ onUpdateAvailable: offerPwaUpdate });
 document.addEventListener("visibilitychange", renderBrowserNotifications);
 renderTasksButton();
 setSendMode("steer", false);

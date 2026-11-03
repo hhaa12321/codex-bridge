@@ -1142,6 +1142,17 @@
         <div class="file-preview-body" id="filePreviewBody"></div>
       </section>
     </div>
+    <dialog class="pwa-update-dialog" id="pwaUpdateDialog" aria-labelledby="pwaUpdateTitle">
+      <h2 id="pwaUpdateTitle" data-i18n="pwaUpdateTitle">Update available</h2>
+      <p data-i18n="pwaUpdateBody">A new version is ready. Update now?</p>
+      <p class="pwa-update-error" id="pwaUpdateError" role="alert" hidden></p>
+      <div class="pwa-update-actions">
+        <button id="pwaUpdateLaterBtn" type="button" data-i18n="pwaUpdateLater">Not now</button>
+        <button class="primary" id="pwaUpdateNowBtn" type="button" data-i18n="pwaUpdateNow">
+          Update now
+        </button>
+      </div>
+    </dialog>
     <div class="scrim" id="scrim"></div>
     <script src="/assets/passkey.js"></script>
     <script type="module" src="/src/main.js"></script>

@@ -13,13 +13,13 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Codex" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="manifest" href="/manifest.webmanifest?v=63ac7fbdfe63" />
+    <link rel="manifest" href="/manifest.webmanifest?v=d388a3e592a0" />
     <link rel="icon" type="image/x-icon" href="/favicon.ico?v=a6e7ec679421" />
     <link rel="icon" type="image/png" sizes="192x192" href="/app-icon-192.png?v=fb7c0de733bf" />
     <link rel="icon" type="image/png" sizes="512x512" href="/app-icon.png?v=c9b92f5a1faa" />
     <link rel="apple-touch-icon" href="/app-icon.png?v=c9b92f5a1faa" />
-    <script type="module" crossorigin src="/assets/app.js?v=ac30ae4d57e5"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=2643737f7b53">
+    <script type="module" crossorigin src="/assets/app.js?v=48bb2a8be2ea"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=e5eeb225dc13">
   </head>
   <body>
     <div class="app">
@@ -1144,6 +1144,17 @@
         <div class="file-preview-body" id="filePreviewBody"></div>
       </section>
     </div>
+    <dialog class="pwa-update-dialog" id="pwaUpdateDialog" aria-labelledby="pwaUpdateTitle">
+      <h2 id="pwaUpdateTitle" data-i18n="pwaUpdateTitle">Update available</h2>
+      <p data-i18n="pwaUpdateBody">A new version is ready. Update now?</p>
+      <p class="pwa-update-error" id="pwaUpdateError" role="alert" hidden></p>
+      <div class="pwa-update-actions">
+        <button id="pwaUpdateLaterBtn" type="button" data-i18n="pwaUpdateLater">Not now</button>
+        <button class="primary" id="pwaUpdateNowBtn" type="button" data-i18n="pwaUpdateNow">
+          Update now
+        </button>
+      </div>
+    </dialog>
     <div class="scrim" id="scrim"></div>
     <script src="/assets/passkey.js"></script>
   </body>

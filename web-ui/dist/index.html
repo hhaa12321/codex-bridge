@@ -18,8 +18,8 @@
     <link rel="icon" type="image/png" sizes="192x192" href="/app-icon-192.png?v=fb7c0de733bf" />
     <link rel="icon" type="image/png" sizes="512x512" href="/app-icon.png?v=c9b92f5a1faa" />
     <link rel="apple-touch-icon" href="/app-icon.png?v=c9b92f5a1faa" />
-    <script type="module" crossorigin src="/assets/app.js?v=48bb2a8be2ea"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=e5eeb225dc13">
+    <script type="module" crossorigin src="/assets/app.js?v=30b808a9d120"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=5feb819d02b6">
   </head>
   <body>
     <div class="app">
@@ -1115,6 +1115,9 @@
           </div>
           <div class="file-preview-actions">
             <button id="filePreviewMode" type="button" hidden></button>
+            <button id="filePreviewShare" type="button" data-i18n="shareFile" hidden>
+              Share file
+            </button>
             <button
               id="filePreviewDownload"
               class="icon-button"
@@ -1141,6 +1144,10 @@
             </button>
           </div>
         </header>
+        <div class="file-preview-transfer" id="filePreviewTransfer" hidden>
+          <progress id="filePreviewProgress" max="100" value="0"></progress>
+          <span id="filePreviewProgressText"></span>
+        </div>
         <div class="file-preview-body" id="filePreviewBody"></div>
       </section>
     </div>

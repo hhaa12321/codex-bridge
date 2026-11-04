@@ -2495,6 +2495,24 @@ main.history-fullscreen .fullscreen-exit-icon {
 .message.goal-trigger {
   margin: 3px 0;
 }
+.async-reply-content {
+  display: grid;
+  gap: 5px;
+}
+.async-reply-heading,
+.async-reply-question {
+  color: color-mix(in srgb, currentColor 66%, transparent);
+  font-size: 11px;
+}
+.async-reply-row {
+  display: grid;
+  gap: 2px;
+}
+.async-reply-row strong {
+  font-size: inherit;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
 .message.goal-trigger .message-head {
   display: none;
 }
@@ -4640,6 +4658,22 @@ label.caption {
 .file-preview-actions button {
   min-height: 32px;
   padding: 5px 9px;
+}
+.file-preview-transfer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.file-preview-transfer[hidden] {
+  display: none;
+}
+.file-preview-transfer progress {
+  flex: 1;
+  height: 5px;
+  accent-color: var(--accent);
 }
 .file-preview-body {
   min-width: 0;

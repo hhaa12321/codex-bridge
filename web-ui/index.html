@@ -1113,6 +1113,9 @@
           </div>
           <div class="file-preview-actions">
             <button id="filePreviewMode" type="button" hidden></button>
+            <button id="filePreviewShare" type="button" data-i18n="shareFile" hidden>
+              Share file
+            </button>
             <button
               id="filePreviewDownload"
               class="icon-button"
@@ -1139,6 +1142,10 @@
             </button>
           </div>
         </header>
+        <div class="file-preview-transfer" id="filePreviewTransfer" hidden>
+          <progress id="filePreviewProgress" max="100" value="0"></progress>
+          <span id="filePreviewProgressText"></span>
+        </div>
         <div class="file-preview-body" id="filePreviewBody"></div>
       </section>
     </div>

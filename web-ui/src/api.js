@@ -10,7 +10,7 @@ export const $ = (id) => document.getElementById(id);
 const demoMode = import.meta.env.VITE_CODEX_BRIDGE_DEMO === "1";
 let demoClient;
 let eventSocket;
-let eventRetryTimer;
+let eventRetryTimer = null;
 let eventRetryDelay = 500;
 let eventStreamUnavailable = false;
 let eventSocketRequestId = null;
@@ -316,6 +316,30 @@ function emitEvent(event) {
   for (const listener of eventListeners) listener(event);
 }
 
+function scheduleEventReconnect(refreshAuth = false) {
+  if (eventRetryTimer !== null) return;
+  const retryDelay = eventRetryDelay;
+  eventRetryDelay = Math.min(eventRetryDelay * 2, 10_000);
+  diagnostics.record("ws_retry", {
+    request_id: eventSocketRequestId,
+    retry_delay_ms: retryDelay,
+    refresh_auth: refreshAuth,
+  });
+  eventRetryTimer = setTimeout(async () => {
+    eventRetryTimer = null;
+    if (refreshAuth) {
+      try {
+        await authentication.refresh();
+      } catch {
+        diagnostics.record("ws_connect_error", { reason_code: "authentication_failed" });
+        scheduleEventReconnect(true);
+        return;
+      }
+    }
+    connectEventStream();
+  }, retryDelay);
+}
+
 async function connectEventStream() {
   if (
     demoMode ||
@@ -324,11 +348,13 @@ async function connectEventStream() {
   )
     return;
   clearTimeout(eventRetryTimer);
+  eventRetryTimer = null;
   try {
     await authenticate();
   } catch {
     eventStreamUnavailable = true;
     diagnostics.record("ws_connect_error", { reason_code: "authentication_failed" });
+    scheduleEventReconnect(true);
     return;
   }
   if (
@@ -380,14 +406,7 @@ async function connectEventStream() {
     });
     eventSocketOpenedAt = 0;
     emitEvent({ type: "bridge_event_stream", status: "disconnected" });
-    if (!eventStreamUnavailable) {
-      diagnostics.record("ws_retry", {
-        request_id: eventSocketRequestId,
-        retry_delay_ms: eventRetryDelay,
-      });
-      eventRetryTimer = setTimeout(connectEventStream, eventRetryDelay);
-      eventRetryDelay = Math.min(eventRetryDelay * 2, 10_000);
-    }
+    scheduleEventReconnect();
   };
   eventSocket.onerror = () => {
     diagnostics.record("ws_error", { request_id: eventSocketRequestId });

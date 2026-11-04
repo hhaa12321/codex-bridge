@@ -89,6 +89,8 @@ struct CachedActivity {
     total_usage: Option<TokenUsageBreakdown>,
     turn_usage_baseline: TokenUsageBreakdown,
     model_context_window: Option<u64>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -876,6 +878,10 @@ pub struct ThreadActivity {
     pub thread_token_usage: Option<TokenUsageBreakdown>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2033,6 +2039,8 @@ impl SessionStore {
                 turn_token_usage: None,
                 thread_token_usage: None,
                 model_context_window: None,
+                model: None,
+                reasoning_effort: None,
             }));
         }
         read_thread_activity(&summary.rollout_path, &self.activity_cache).map(Some)
@@ -3264,6 +3272,8 @@ fn read_thread_activity(
                 .map(|usage| usage.since(cached.turn_usage_baseline)),
             thread_token_usage: cached.total_usage,
             model_context_window: cached.model_context_window,
+            model: cached.model.clone(),
+            reasoning_effort: cached.reasoning_effort.clone(),
         });
     }
 
@@ -3274,6 +3284,8 @@ fn read_thread_activity(
         mut total_usage,
         mut turn_usage_baseline,
         mut model_context_window,
+        mut model,
+        mut reasoning_effort,
     ) = cached
         .filter(|cached| cached.processed_len <= file_len)
         .map(|cached| {
@@ -3284,6 +3296,8 @@ fn read_thread_activity(
                 cached.total_usage,
                 cached.turn_usage_baseline,
                 cached.model_context_window,
+                cached.model,
+                cached.reasoning_effort,
             )
         })
         .unwrap_or((
@@ -3292,6 +3306,8 @@ fn read_thread_activity(
             Vec::new(),
             None,
             TokenUsageBreakdown::default(),
+            None,
+            None,
             None,
         ));
     let mut file =
@@ -3323,6 +3339,8 @@ fn read_thread_activity(
             &mut total_usage,
             &mut turn_usage_baseline,
             &mut model_context_window,
+            &mut model,
+            &mut reasoning_effort,
         );
     }
     if let Ok(mut cache) = cache.lock() {
@@ -3335,6 +3353,8 @@ fn read_thread_activity(
                 total_usage,
                 turn_usage_baseline,
                 model_context_window,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
             },
         );
     }
@@ -3350,6 +3370,8 @@ fn read_thread_activity(
             .map(|usage| usage.since(turn_usage_baseline)),
         thread_token_usage: total_usage,
         model_context_window,
+        model,
+        reasoning_effort,
         active_turn_id,
     })
 }
@@ -3366,6 +3388,7 @@ fn activity_phase(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_activity(
     record: &Value,
     active_turn_id: &mut Option<String>,
@@ -3373,7 +3396,19 @@ fn update_activity(
     total_usage: &mut Option<TokenUsageBreakdown>,
     turn_usage_baseline: &mut TokenUsageBreakdown,
     model_context_window: &mut Option<u64>,
+    model: &mut Option<String>,
+    reasoning_effort: &mut Option<String>,
 ) {
+    if record.get("type").and_then(Value::as_str) == Some("turn_context") {
+        if let Some(value) = record.pointer("/payload/model").and_then(Value::as_str) {
+            *model = Some(value.to_owned());
+            *reasoning_effort = record
+                .pointer("/payload/effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+        return;
+    }
     if record.get("type").and_then(Value::as_str) == Some("response_item") {
         let payload = &record["payload"];
         let payload_type = payload.get("type").and_then(Value::as_str);
@@ -3717,6 +3752,8 @@ mod tests {
         let mut total_usage = None;
         let mut baseline = TokenUsageBreakdown::default();
         let mut model_context_window = None;
+        let mut model = None;
+        let mut reasoning_effort = None;
         {
             let mut apply = |record: Value| {
                 update_activity(
@@ -3726,6 +3763,8 @@ mod tests {
                     &mut total_usage,
                     &mut baseline,
                     &mut model_context_window,
+                    &mut model,
+                    &mut reasoning_effort,
                 );
             };
             apply(
@@ -5175,5 +5214,22 @@ text(await tools.web__run({search_query:[{q:"Codex app-server"}],response_length
         )
         .unwrap();
         assert_eq!(store.active_turn_id("thread-active").unwrap(), None);
+
+        file.write_all(
+            br#"{"timestamp":"2026-08-30T01:00:07Z","type":"turn_context","payload":{"model":"model-a","effort":"low"}}
+"#,
+        )
+        .unwrap();
+        let activity = store.thread_activity("thread-active").unwrap().unwrap();
+        assert_eq!(activity.model.as_deref(), Some("model-a"));
+        assert_eq!(activity.reasoning_effort.as_deref(), Some("low"));
+        file.write_all(
+            br#"{"timestamp":"2026-08-30T01:00:08Z","type":"turn_context","payload":{"model":"model-b","effort":"high"}}
+"#,
+        )
+        .unwrap();
+        let activity = store.thread_activity("thread-active").unwrap().unwrap();
+        assert_eq!(activity.model.as_deref(), Some("model-b"));
+        assert_eq!(activity.reasoning_effort.as_deref(), Some("high"));
     }
 }

@@ -72,6 +72,8 @@ export const state = {
   modelOptions: [],
   composerModel: null,
   composerEffort: null,
+  rolloutModel: null,
+  rolloutEffort: null,
   usageUnavailable: false,
   directAppServer: false,
   appServerMode: null,

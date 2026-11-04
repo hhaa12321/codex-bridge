@@ -47,13 +47,13 @@ Codex CLI/app-server version is pinned to `0.164.0`.
 
 ## Release highlights
 
-### v0.3.14 · 2026-10-22
+### v0.3.15 · 2026-11-03
 
-- **Conversation state:** compaction is visible while it runs, and Goal stays as a single line beside the session title until opened.
-- **Tools and usage:** running tool groups show elapsed time; session token totals include each model's reasoning effort.
-- **Reliability:** stale queued messages can be withdrawn after a turn ends, and tool images remain available in session history.
+- **Reliable messages:** queued and Steer messages reconcile with conversation history, including long-running sessions.
+- **Clearer status:** new projects appear automatically, model changes show when they are still taking effect, and clarification replies appear in the message flow.
+- **Files:** downloads show progress; iOS can share a file from its preview without leaving the app.
 
-See the [latest release notes](docs/releases/v0.3.14.md) or the
+See the [latest release notes](docs/releases/v0.3.15.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI

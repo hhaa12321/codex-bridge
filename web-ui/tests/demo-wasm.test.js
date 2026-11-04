@@ -28,6 +28,7 @@ import {
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { goalToggleState } from "../src/goal-state.js";
 import { goalPanelKey, questionPanelKey, snapshotIsCurrent } from "../src/floating-panel-state.js";
+import { modelStatusLabel } from "../src/model-transition.js";
 import { asyncQuestionReplyMode } from "../src/async-question-state.js";
 import { commandPickerTrigger } from "../src/command-picker.js";
 import { appendLiveCommandText, commandOutputModel, isCommandTool } from "../src/command-output.js";
@@ -257,6 +258,20 @@ test("async clarification answers steer only into their originating turn", () =>
   assert.equal(asyncQuestionReplyMode("turn-a", "turn-a"), "steer");
   assert.equal(asyncQuestionReplyMode("turn-a", "turn-b"), "changed");
   assert.equal(asyncQuestionReplyMode("turn-a", null), "new_turn");
+});
+
+test("async clarification replies render as question and answer content", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /if \(item\.kind === "async_question_reply"\)/);
+  assert.match(source, /question\.textContent = reply\.question \|\| ""/);
+  assert.match(source, /answer\.textContent = reply\.answer \|\| ""/);
+});
+
+test("project changes refresh the sidebar through Bridge events", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /event\?\.type === "bridge_projects_changed"/);
+  assert.match(source, /scheduleProjectRefresh\(\)/);
+  assert.match(source, /loadProjects\(\{ restoreSession: false \}\)/);
 });
 import { isLocalImagePath, localFilePath, localFileReference } from "../src/markdown.js";
 import { memoryCitationModel } from "../src/memory-citations.js";
@@ -1654,9 +1669,15 @@ test("local workspace files open in a typed preview before download", async () =
   assert.match(preview, /frame\.srcdoc = secureHtmlPreviewDocument/);
   assert.match(preview, /"script-src 'none'"/);
   assert.match(preview, /"connect-src 'none'"/);
+  assert.match(preview, /response\.body\.getReader\(\)/);
+  assert.match(preview, /navigator\.canShare\(\{ files: \[file\] \}\)/);
+  assert.match(preview, /await navigator\.share\(\{ files: \[downloadedFile\] \}\)/);
   assert.match(html, /id="filePreviewDialog"/);
+  assert.match(html, /id="filePreviewShare"/);
+  assert.match(html, /id="filePreviewTransfer"/);
   assert.match(stylesheet, /\.file-preview-card\s*\{/);
   assert.match(stylesheet, /\.file-preview-html\s*\{/);
+  assert.match(stylesheet, /\.file-preview-transfer\s*\{/);
 });
 
 test("interrupt requests carry the app-server turn observed by the UI", async () => {
@@ -1779,6 +1800,13 @@ test("only the last tool group in a running turn receives live state", () => {
     activeToolGroupTarget([commentary, newestCommentary], "turn-a", "call-3"),
     newestCommentary,
   );
+});
+
+test("composer model status distinguishes rollout and selected settings", () => {
+  assert.equal(modelStatusLabel(null, null, "gpt-5", "high"), "gpt-5 · high");
+  assert.equal(modelStatusLabel("gpt-5", "high", "gpt-5", "high"), "gpt-5 · high");
+  assert.equal(modelStatusLabel("gpt-5", "low", "gpt-5", "high"), "gpt-5 · low → gpt-5 · high");
+  assert.equal(modelStatusLabel("gpt-5", "high", null, null), "gpt-5 · high");
 });
 
 test("a new model phase ends the prior tool group's running presentation immediately", async () => {
@@ -3806,6 +3834,32 @@ test("authentication gate serializes concurrent startup requests", async () => {
   await Promise.all([first, second]);
   await gate.wait();
   assert.equal(probes, 1);
+});
+
+test("a transient auth failure can retry and event streams recover after outages", async () => {
+  let probes = 0;
+  const gate = createAuthenticationGate(async () => {
+    if (++probes === 1) throw new Error("bridge restarting");
+  });
+  await assert.rejects(gate.wait(), /bridge restarting/);
+  await gate.refresh();
+  assert.equal(probes, 2);
+  gate.block(new Error("session expired"));
+  await assert.rejects(gate.wait(), /session expired/);
+  assert.equal(probes, 2);
+
+  const api = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
+  const reconnect = api.slice(
+    api.indexOf("function scheduleEventReconnect("),
+    api.indexOf("async function connectEventStream()"),
+  );
+  const onClose = api.slice(
+    api.indexOf("eventSocket.onclose ="),
+    api.indexOf("eventSocket.onerror ="),
+  );
+  assert.match(reconnect, /await authentication\.refresh\(\)/);
+  assert.match(reconnect, /scheduleEventReconnect\(true\)/);
+  assert.match(onClose, /scheduleEventReconnect\(\)/);
 });
 
 test("demo session rename updates subsequent thread reads", async () => {

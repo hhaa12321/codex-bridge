@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Form, Query, RawQuery, Request as AxumRequest, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -58,6 +58,7 @@ const MAX_DOWNLOAD_BYTES: u64 = 33 * 1024 * 1024;
 const DESKTOP_WS_MAX_BYTES: usize = 64 << 20;
 const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 const PROJECT_INDEX_TTL: Duration = Duration::from_secs(10);
+const PROJECT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
 const APP_SERVER_ADOPTION_STABILITY_WINDOW: Duration = Duration::from_secs(2);
 const APP_SERVER_ADOPTION_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_DOWNLOAD_TICKETS: usize = 128;
@@ -1099,12 +1100,10 @@ impl PendingMessages {
         };
         let mut messages_by_thread = HashMap::new();
         let mut landed = HashSet::new();
+        let mut verified_turns = HashSet::new();
         let completed = entries
             .iter()
             .filter_map(|entry| {
-                if entry.status == "failed" {
-                    return None;
-                }
                 let messages = messages_by_thread
                     .entry(entry.thread_id.clone())
                     .or_insert_with(|| {
@@ -1114,19 +1113,54 @@ impl PendingMessages {
                             .flatten()
                             .unwrap_or_else(|| (0, Vec::new()))
                     });
-                let landed_in_history =
+                let mut landed_in_history =
                     pending_message_landed(entry, &messages.1, messages.0, &mut landed);
-                let finished_turn = !landed_in_history
-                    && entry.action == "steer"
+                // A long running thread can move the queued input beyond the
+                // recent window before delivery is confirmed. Failed entries
+                // must also be checked: the rollout may have landed while the
+                // queue monitor was waiting for it.
+                if !landed_in_history && entry.after_message_index < messages.0 as i64 {
+                    let mut before = messages.0;
+                    while before > entry.after_message_index.saturating_add(1).max(0) as usize {
+                        let Ok(Some((_, page))) =
+                            session_store.read_message_page(&entry.thread_id, Some(before), 256)
+                        else {
+                            break;
+                        };
+                        if page.start == before {
+                            break;
+                        }
+                        landed_in_history =
+                            pending_message_landed(entry, &page.messages, page.start, &mut landed);
+                        before = page.start;
+                        if landed_in_history {
+                            break;
+                        }
+                    }
+                }
+                let target_turn = (entry.action == "steer"
                     && entry.status == "accepted"
-                    && entry.turn_id.as_deref().is_some_and(|turn_id| {
-                        session_store
-                            .read_turn_messages(&entry.thread_id, turn_id)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|messages| accepted_steer_turn_finished(entry, &messages))
+                    && entry.turn_id.is_some())
+                .then(|| {
+                    session_store
+                        .read_turn_messages(&entry.thread_id, entry.turn_id.as_deref()?)
+                        .ok()
+                        .flatten()
+                })
+                .flatten();
+                if target_turn.is_some() {
+                    verified_turns.insert(entry.id.clone());
+                }
+                let landed_in_turn = !landed_in_history
+                    && target_turn.as_ref().is_some_and(|messages| {
+                        accepted_steer_landed_in_turn(entry, messages, &mut landed)
                     });
-                (landed_in_history || finished_turn).then(|| {
+                let finished_turn = !landed_in_history
+                    && !landed_in_turn
+                    && target_turn
+                        .as_ref()
+                        .is_some_and(|messages| accepted_steer_turn_finished(entry, messages));
+                (landed_in_history || landed_in_turn || finished_turn).then(|| {
                     let mut completed = entry.clone();
                     completed.status = "applied".to_owned();
                     completed
@@ -1138,6 +1172,20 @@ impl PendingMessages {
             .map(|entry| entry.id.as_str())
             .collect::<HashSet<_>>();
         entries.retain(|entry| !completed_ids.contains(entry.id.as_str()));
+        for entry in entries.iter_mut() {
+            let Some((start, messages)) = messages_by_thread.get(&entry.thread_id) else {
+                continue;
+            };
+            if verified_turns.contains(&entry.id)
+                && accepted_steer_superseded(entry, messages, *start)
+            {
+                entry.status = "failed".to_owned();
+                entry.error = Some(
+                    "the accepted Steer did not appear before its turn ended; withdraw to restore the text"
+                        .to_owned(),
+                );
+            }
+        }
         if !completed.is_empty() {
             if let Ok(mut tombstones) = self.completed.write() {
                 for entry in completed {
@@ -1586,6 +1634,40 @@ fn accepted_steer_turn_finished(
             && message.role == "assistant"
             && message.phase.as_deref() == Some("final_answer")
     })
+}
+
+fn accepted_steer_landed_in_turn(
+    entry: &PendingMessage,
+    messages: &[(usize, ThreadMessage)],
+    landed: &mut HashSet<(String, usize, String)>,
+) -> bool {
+    messages.iter().any(|(index, message)| {
+        if *index as i64 <= entry.after_message_index || message.role != "user" {
+            return false;
+        }
+        if message.id.as_deref() == Some(entry.id.as_str()) {
+            return true;
+        }
+        thread_message_input_summary(message).is_some_and(|text| {
+            text == entry.text && landed.insert((entry.thread_id.clone(), *index, text))
+        })
+    })
+}
+
+fn accepted_steer_superseded(
+    entry: &PendingMessage,
+    messages: &[ThreadMessage],
+    message_start: usize,
+) -> bool {
+    entry.action == "steer"
+        && entry.status == "accepted"
+        && entry.turn_id.is_some()
+        && messages.iter().enumerate().any(|(offset, message)| {
+            (message_start + offset) as i64 > entry.after_message_index
+                && message.role == "user"
+                && message.turn_id.is_some()
+                && message.turn_id != entry.turn_id
+        })
 }
 
 fn thread_message_input_summary(message: &ThreadMessage) -> Option<String> {
@@ -4006,6 +4088,7 @@ async fn main() -> Result<()> {
         session_run_states,
         args.app_server_thread_cache,
     );
+    let project_monitor = spawn_project_monitor(bridge_state.clone());
 
     println!("codex-bridge listening on {}", socket_path.display());
 
@@ -4114,6 +4197,9 @@ async fn main() -> Result<()> {
     }
     if let Some(hot_cache_task) = hot_cache_task {
         hot_cache_task.abort();
+    }
+    if let Some(project_monitor) = project_monitor {
+        project_monitor.abort();
     }
     codex_gui_monitor.abort();
     capability_monitor.abort();
@@ -4231,6 +4317,96 @@ fn spawn_hot_session_cache(
                         }
                     }).await;
                     last_warm.retain(|_, last| last.elapsed() < Duration::from_secs(60));
+                }
+            }
+        }
+    }))
+}
+
+fn project_catalog_signature(projects: &[Value], sections: &[Value]) -> Vec<String> {
+    let mut entries = projects
+        .iter()
+        .map(|project| {
+            json!({
+                "kind": "project",
+                "id": project.get("id"),
+                "name": project.get("name"),
+                "roots": project.get("roots"),
+            })
+            .to_string()
+        })
+        .chain(sections.iter().map(|section| {
+            json!({
+                "kind": "section",
+                "id": section.get("id"),
+                "name": section.get("name"),
+                "projectIds": section.get("projectIds"),
+            })
+            .to_string()
+        }))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries
+}
+
+fn fetch_project_catalog_signature(
+    backend: &CodexCliBackend,
+) -> Result<Vec<String>, BackendFailure> {
+    let projects = app_server_list_all(
+        backend,
+        "project/list",
+        json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+    )?;
+    let sections = app_server_list_all(backend, "threadSection/list", json!({"limit": 100}))
+        .unwrap_or_default();
+    Ok(project_catalog_signature(&projects, &sections))
+}
+
+fn publish_project_change(state: &BridgeState) {
+    if let Ok(mut cached) = state.app_server_projects.index.write() {
+        *cached = None;
+    }
+    state.session_store.invalidate_summary_cache();
+    state
+        .write_backend
+        .publish_bridge_event(json!({"type": "bridge_projects_changed"}));
+}
+
+fn spawn_project_monitor(state: BridgeState) -> Option<tokio::task::JoinHandle<()>> {
+    let mut events = state.write_backend.subscribe_app_server_events()?;
+    Some(tokio::spawn(async move {
+        let mut refresh = tokio::time::interval(PROJECT_DISCOVERY_INTERVAL);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous = None;
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    match event {
+                        Ok(event) => {
+                            let method = event.pointer("/message/method").and_then(Value::as_str);
+                            if method == Some("thread/started") {
+                                publish_project_change(&state);
+                            } else if method.is_some_and(|method| {
+                                method.starts_with("project/") || method.starts_with("threadSection/")
+                            }) {
+                                refresh.reset_immediately();
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => refresh.reset_immediately(),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = refresh.tick() => {
+                    let backend = Arc::clone(&state.write_backend);
+                    let result = tokio::task::spawn_blocking(move || {
+                        fetch_project_catalog_signature(&backend)
+                    }).await;
+                    if let Ok(Ok(signature)) = result {
+                        if previous.as_ref().is_some_and(|previous| previous != &signature) {
+                            publish_project_change(&state);
+                        }
+                        previous = Some(signature);
+                    }
                 }
             }
         }
@@ -5282,16 +5458,23 @@ async fn web_file_download(
         )
             .into_response();
     };
-    let write_backend = Arc::clone(&state.bridge.write_backend);
     let result = tokio::task::spawn_blocking(move || {
-        read_workspace_download_with(
-            &ticket.workspace,
-            ticket.path.to_string_lossy().as_ref(),
-            |path| read_file_bytes(&write_backend, path),
-        )
+        let (path, filename, _) =
+            resolve_workspace_download(&ticket.workspace, ticket.path.to_string_lossy().as_ref())?;
+        let file = File::open(path).map_err(|_| FileDownloadFailure::ReadFailed)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| FileDownloadFailure::ReadFailed)?;
+        if !metadata.is_file() {
+            return Err(FileDownloadFailure::NotAFile);
+        }
+        if metadata.len() >= MAX_DOWNLOAD_BYTES {
+            return Err(FileDownloadFailure::TooLarge);
+        }
+        Ok((file, filename, metadata.len()))
     })
     .await;
-    let (bytes, filename) = match result {
+    let (file, filename, size) = match result {
         Ok(Ok(download)) => download,
         Ok(Err(FileDownloadFailure::ThreadNotFound | FileDownloadFailure::FileNotFound)) => {
             return (StatusCode::NOT_FOUND, "file not found").into_response();
@@ -5318,10 +5501,39 @@ async fn web_file_download(
                 .into_response();
         }
     };
-    let mut response = bytes.into_response();
+    let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+    tokio::task::spawn_blocking(move || {
+        let mut file = file.take(size);
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if tx
+                        .blocking_send(Ok(Bytes::copy_from_slice(&chunk[..count])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    });
+    let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&size.to_string()).expect("valid file size"),
     );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
@@ -5534,6 +5746,7 @@ async fn web_file_preview(
     };
     let store = Arc::clone(&state.bridge.session_store);
     let write_backend = Arc::clone(&state.bridge.write_backend);
+    let app_server_tools = Arc::clone(&state.bridge.app_server_tools);
     let visible_directories = Arc::clone(&state.visible_directories);
     let resolved = tokio::task::spawn_blocking(move || {
         let thread = store
@@ -5600,11 +5813,16 @@ async fn web_file_preview(
                     .read_message(&request.thread_id, message_index)
                     .map_err(|_| FileDownloadFailure::FileNotFound)?
                     .ok_or(FileDownloadFailure::FileNotFound)?;
-                let tool = message
-                    .tools
-                    .get(tool_index)
-                    .ok_or(FileDownloadFailure::FileNotFound)?;
-                if !tool_authorizes_image_path(tool, &request.path) {
+                let typed_tools = app_server_tools_for_messages(
+                    &write_backend,
+                    &app_server_tools,
+                    &request.thread_id,
+                    std::slice::from_ref(&message),
+                )
+                .ok();
+                let authorized = displayed_tool(&message, typed_tools.as_ref(), tool_index)
+                    .is_some_and(|tool| tool_authorizes_image_path(tool, &request.path));
+                if !authorized {
                     return Err(FileDownloadFailure::OutsideWorkspace);
                 }
                 let path = fs::canonicalize(&request.path)
@@ -5682,6 +5900,18 @@ fn tool_authorizes_image_path(tool: &ThreadToolCall, requested: &str) -> bool {
             .get("path")
             .and_then(Value::as_str)
             .is_some_and(|path| path == requested)
+}
+
+fn displayed_tool<'a>(
+    message: &'a ThreadMessage,
+    typed_tools: Option<&'a HashMap<String, Vec<ThreadToolCall>>>,
+    tool_index: usize,
+) -> Option<&'a ThreadToolCall> {
+    if let Some(tools) = message.id.as_ref().and_then(|id| typed_tools?.get(id)) {
+        tools.get(tool_index)
+    } else {
+        message.tools.get(tool_index)
+    }
 }
 
 fn issue_download_ticket(
@@ -5841,6 +6071,7 @@ fn read_workspace_download(
     })
 }
 
+#[cfg(test)]
 fn read_workspace_download_with(
     workspace: &Path,
     requested: &str,
@@ -7512,6 +7743,24 @@ fn infer_wait_activity(item: &Value, subagent: Option<&(String, String)>) -> Opt
     Some(enriched)
 }
 
+fn parse_async_question_replies(text: &str) -> Option<Vec<Value>> {
+    let body = text
+        .trim()
+        .strip_prefix("<send_user_message_question_reply>")?
+        .strip_suffix("</send_user_message_question_reply>")?
+        .trim();
+    let replies = serde_json::from_str::<Vec<Value>>(body).ok()?;
+    (!replies.is_empty()
+        && replies.iter().all(|reply| {
+            reply
+                .get("questionItemId")
+                .and_then(Value::as_str)
+                .is_some()
+                && reply.get("answer").and_then(Value::as_str).is_some()
+        }))
+    .then_some(replies)
+}
+
 fn async_question_reply_ids(item: &Value) -> Vec<String> {
     if item.get("type").and_then(Value::as_str) != Some("userMessage") {
         return Vec::new();
@@ -7522,11 +7771,7 @@ fn async_question_reply_ids(item: &Value) -> Vec<String> {
     content
         .iter()
         .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .filter_map(|text| {
-            text.strip_prefix("<send_user_message_question_reply>\n")?
-                .split_once("\n</send_user_message_question_reply>")
-                .and_then(|(body, _)| serde_json::from_str::<Vec<Value>>(body).ok())
-        })
+        .filter_map(parse_async_question_replies)
         .flatten()
         .filter_map(|reply| reply.get("questionItemId")?.as_str().map(str::to_owned))
         .collect()
@@ -9268,14 +9513,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     std::slice::from_ref(&message),
                 )
                 .ok();
-                let typed_tool = message.id.as_ref().and_then(|id| {
-                    typed_tools
-                        .as_ref()
-                        .and_then(|tools| tools.get(id))
-                        .and_then(|tools| tools.get(tool_index as usize))
-                        .cloned()
-                });
-                let tool = typed_tool.or_else(|| message.tools.get(tool_index as usize).cloned());
+                let tool =
+                    displayed_tool(&message, typed_tools.as_ref(), tool_index as usize).cloned();
                 let Some(tool) = tool else {
                     return Response::error(
                         "tool_content_not_found",
@@ -11652,7 +11891,18 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
         }
 
         if let Some(text) = text {
-            if let Some(objective) = goal_objective(text) {
+            if let Some(replies) = parse_async_question_replies(text) {
+                content.push(json!({
+                    "kind": "async_question_reply",
+                    "replies": replies.into_iter().map(|reply| json!({
+                        "question": reply.get("question").and_then(Value::as_str).unwrap_or_default(),
+                        "answer": reply.get("answer").and_then(Value::as_str).unwrap_or_default(),
+                    })).collect::<Vec<_>>(),
+                }));
+                has_visible_text = true;
+                content_index += 1;
+                continue;
+            } else if let Some(objective) = goal_objective(text) {
                 if !objective.trim().is_empty() {
                     content.push(json!({"kind": "goal", "text": objective.trim()}));
                     has_goal_trigger = true;
@@ -12694,11 +12944,31 @@ mod tests {
         let id = serde_json::json!(["request_user_input_async", "call-example", 0]).to_string();
         let body =
             serde_json::json!([{"questionItemId": id, "question": "Choose", "answer": "One"}]);
+        let text = format!(
+            "<send_user_message_question_reply>\n{body}\n</send_user_message_question_reply>"
+        );
         let item = serde_json::json!({
             "type": "userMessage",
-            "content": [{"type": "text", "text": format!("<send_user_message_question_reply>\n{body}\n</send_user_message_question_reply>")}]
+            "content": [{"type": "text", "text": text}]
         });
         assert_eq!(super::async_question_reply_ids(&item), vec![id]);
+        let message = ThreadMessage {
+            timestamp: None,
+            id: Some("reply".into()),
+            turn_id: Some("turn-1".into()),
+            role: "user".into(),
+            phase: None,
+            content: vec![json!({"type": "input_text", "text": text})],
+            tools: Vec::new(),
+        };
+        let compact = super::compact_web_message(&message, 0);
+        assert_eq!(compact["content"][0]["kind"], "async_question_reply");
+        assert_eq!(compact["content"][0]["replies"][0]["question"], "Choose");
+        assert_eq!(compact["content"][0]["replies"][0]["answer"], "One");
+        assert!(compact["content"][0]["replies"][0]
+            .get("questionItemId")
+            .is_none());
+        assert!(super::parse_async_question_replies(&format!("`{text}`")).is_none());
         assert!(
             super::async_question_reply_ids(&serde_json::json!({"type": "agentMessage"}))
                 .is_empty()
@@ -14650,6 +14920,67 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn accepted_steer_missing_from_an_aborted_turn_becomes_recoverable() {
+        let pending = PendingMessages::default();
+        let (id, _) = pending
+            .begin("thread-1", "lost guidance", "steer", 12, None)
+            .unwrap();
+        pending.accept(&id, Some("turn-1".to_owned()));
+        let entry = pending.get(&id).unwrap();
+        let later_user = ThreadMessage {
+            timestamp: None,
+            id: None,
+            turn_id: Some("turn-2".to_owned()),
+            role: "user".to_owned(),
+            phase: None,
+            content: vec![json!({"type":"input_text","text":"next task"})],
+            tools: Vec::new(),
+        };
+        assert!(accepted_steer_superseded(
+            &entry,
+            std::slice::from_ref(&later_user),
+            13
+        ));
+        assert!(!accepted_steer_superseded(
+            &entry,
+            std::slice::from_ref(&later_user),
+            12
+        ));
+        assert!(!accepted_steer_superseded(
+            &entry,
+            &[ThreadMessage {
+                turn_id: Some("turn-1".to_owned()),
+                ..later_user
+            }],
+            13
+        ));
+    }
+
+    #[test]
+    fn accepted_steer_can_match_its_old_turn_after_recent_window_moves() {
+        let pending = PendingMessages::default();
+        let (id, _) = pending
+            .begin("thread-1", "landed guidance", "steer", 12, None)
+            .unwrap();
+        pending.accept(&id, Some("turn-1".to_owned()));
+        let entry = pending.get(&id).unwrap();
+        let landed = ThreadMessage {
+            timestamp: None,
+            id: None,
+            turn_id: Some("turn-1".to_owned()),
+            role: "user".to_owned(),
+            phase: None,
+            content: vec![json!({"type":"input_text","text":"landed guidance"})],
+            tools: Vec::new(),
+        };
+        assert!(accepted_steer_landed_in_turn(
+            &entry,
+            &[(13, landed)],
+            &mut HashSet::new()
+        ));
+    }
+
+    #[test]
     fn stable_submission_id_is_idempotent_before_and_after_application() {
         let pending = PendingMessages::default();
         let (id, created) = pending
@@ -14859,6 +15190,18 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .as_deref(),
             Some("thread-2")
         );
+    }
+
+    #[test]
+    fn project_catalog_signature_ignores_recency_and_order_but_detects_new_roots() {
+        let first =
+            json!({"id":"p1","name":"Workspace","roots":[{"path":"/example/a"}],"recencyAt":1});
+        let later =
+            json!({"id":"p1","name":"Workspace","roots":[{"path":"/example/a"}],"recencyAt":2});
+        let added = json!({"id":"p2","name":"Other","roots":[{"path":"/example/b"}]});
+        let initial = project_catalog_signature(&[first], &[]);
+        assert_eq!(initial, project_catalog_signature(&[later.clone()], &[]));
+        assert_ne!(initial, project_catalog_signature(&[later, added], &[]));
     }
 
     #[test]
@@ -15293,6 +15636,45 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "/other-workspace/image.png"
         ));
         assert!(!tool_authorizes_image_path(&tool, "/etc/passwd"));
+    }
+
+    #[test]
+    fn image_preview_uses_the_same_app_server_tool_index_as_the_message_list() {
+        let raw = ThreadToolCall {
+            call_id: "raw".into(),
+            name: "exec".into(),
+            status: "completed".into(),
+            input: json!({"code":"view image"}),
+            output: None,
+            has_image: true,
+        };
+        let viewed = ThreadToolCall {
+            call_id: "viewed".into(),
+            name: "view_image".into(),
+            status: "completed".into(),
+            input: json!({"path":"/other-workspace/screenshot.png"}),
+            output: None,
+            has_image: true,
+        };
+        let message = ThreadMessage {
+            timestamp: None,
+            id: Some("message-1".into()),
+            turn_id: None,
+            role: "assistant".into(),
+            phase: None,
+            content: Vec::new(),
+            tools: vec![raw],
+        };
+        let typed = HashMap::from([("message-1".into(), vec![viewed])]);
+        assert!(tool_authorizes_image_path(
+            displayed_tool(&message, Some(&typed), 0).unwrap(),
+            "/other-workspace/screenshot.png"
+        ));
+        assert!(displayed_tool(&message, Some(&typed), 1).is_none());
+        assert!(!tool_authorizes_image_path(
+            displayed_tool(&message, Some(&typed), 0).unwrap(),
+            "/other-workspace/other.png"
+        ));
     }
 
     #[test]

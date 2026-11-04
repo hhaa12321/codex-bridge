@@ -17,6 +17,7 @@ import {
 import { approvalRequestModel, approvalResponseFor } from "./approval-state.js";
 import { diagnostics } from "./client-diagnostics.js";
 import { goalToggleState } from "./goal-state.js";
+import { modelStatusLabel } from "./model-transition.js";
 import { asyncQuestionReplyMode } from "./async-question-state.js";
 import { questionPanelKey, snapshotIsCurrent } from "./floating-panel-state.js";
 import { commandPickerTrigger } from "./command-picker.js";
@@ -1372,8 +1373,11 @@ async function openDefaultProjectThread() {
   const threads = await loadProjectThreads(project);
   if (threads.length) await openThread(threads[0], { replaceHash: true });
 }
+let projectsLoadVersion = 0;
 async function loadProjects({ restoreSession = true } = {}) {
+  const version = ++projectsLoadVersion;
   const r = await command({ command: "projects", include_archived: $("archived").checked }, false);
+  if (version !== projectsLoadVersion) return;
   state.projects = r.projects || [];
   state.projectThreads.clear();
   state.projectLoadGeneration += 1;
@@ -1407,6 +1411,14 @@ async function loadProjects({ restoreSession = true } = {}) {
     await openDefaultProjectThread();
   }
   preloadExpandedProjectThreads();
+}
+let projectRefreshTimer = null;
+function scheduleProjectRefresh() {
+  if (projectRefreshTimer !== null) return;
+  projectRefreshTimer = setTimeout(() => {
+    projectRefreshTimer = null;
+    loadProjects({ restoreSession: false }).catch(() => {});
+  }, 100);
 }
 async function loadRecentThreads() {
   const generation = ++state.recentLoadGeneration;
@@ -3790,8 +3802,13 @@ async function getFilePreview() {
         body: $("filePreviewBody"),
         closeButton: $("filePreviewClose"),
         downloadButton: $("filePreviewDownload"),
+        shareButton: $("filePreviewShare"),
+        transfer: $("filePreviewTransfer"),
+        progress: $("filePreviewProgress"),
+        progressText: $("filePreviewProgressText"),
         modeButton: $("filePreviewMode"),
         translate: tr,
+        onError: (error) => notify(error.message || String(error), true),
         renderMarkdown: (source) => markdownNode(source, markdownOptions(state.current?.id)),
         inspectImage: openImageViewer,
       }),
@@ -3845,6 +3862,27 @@ function appendContextValue(details, value, label) {
 }
 function contentNode(item, threadId = state.current?.id) {
   if (item.kind === "text") return markdownNode(item.text, markdownOptions(threadId));
+  if (item.kind === "async_question_reply") {
+    const container = document.createElement("div"),
+      heading = document.createElement("span");
+    container.className = "async-reply-content";
+    heading.className = "async-reply-heading";
+    heading.textContent = tr("asyncQuestionAnswer");
+    container.append(heading);
+    for (const reply of item.replies || []) {
+      const row = document.createElement("div"),
+        question = document.createElement("span"),
+        answer = document.createElement("strong");
+      row.className = "async-reply-row";
+      question.className = "async-reply-question";
+      question.textContent = reply.question || "";
+      answer.textContent = reply.answer || "";
+      if (reply.question) row.append(question);
+      row.append(answer);
+      container.append(row);
+    }
+    return container;
+  }
   if (item.kind === "goal") {
     const details = document.createElement("details"),
       summary = document.createElement("summary"),
@@ -5246,8 +5284,15 @@ function messageNode(
     box.dataset.longMessageKey = expansionKey;
   }
   const copyText = content
-    .filter((item) => item.kind === "text" && typeof item.text === "string")
-    .map((item) => item.text)
+    .flatMap((item) =>
+      item.kind === "text" && typeof item.text === "string"
+        ? [item.text]
+        : item.kind === "async_question_reply"
+          ? (item.replies || []).map((reply) =>
+              [reply.question, reply.answer].filter(Boolean).join(": "),
+            )
+          : [],
+    )
     .join("\n\n");
   const copy = copyText ? messageCopyButton(copyText) : null,
     tools = toolGroupNode(m, activeToolCallId, threadId, liveTool, turnRunning);
@@ -6215,6 +6260,16 @@ function setUsageUnavailable(error) {
   $("composerStatus").hidden = false;
   renderPending();
 }
+function renderComposerModelStatus() {
+  const label = modelStatusLabel(
+    state.rolloutModel,
+    state.rolloutEffort,
+    state.composerModel,
+    state.composerEffort,
+  );
+  $("effortState").textContent = label || tr("selectModel");
+  $("modelPickerBtn").title = label || tr("selectModelHelp");
+}
 async function refreshComposerStatus() {
   if (!state.current || document.hidden) return;
   const usage = $("usageState"),
@@ -6269,10 +6324,7 @@ async function refreshComposerStatus() {
     : "";
   health.hidden = !weeklySupported || Boolean(weekly);
   health.title = weeklySupported ? r.weekly_usage_error?.message || "" : "";
-  effort.textContent = state.composerModel
-    ? [state.composerModel, state.composerEffort].filter(Boolean).join(" · ")
-    : tr("selectModel");
-  $("modelPickerBtn").title = state.composerModel ? effort.textContent : tr("selectModelHelp");
+  renderComposerModelStatus();
   $("modelPickerBtn").disabled = !currentThreadWritable();
   $("composerStatus").hidden = !state.current;
   renderPending();
@@ -6402,6 +6454,9 @@ async function refreshActivity() {
     previous = state.activityFileLen,
     previousPhase = state.activityPhase,
     previousToolCallId = state.activeToolCallId;
+  state.rolloutModel = activity.model || null;
+  state.rolloutEffort = activity.reasoning_effort || null;
+  renderComposerModelStatus();
   state.activityFileLen = activity.file_len;
   const authoritativeActive = state.authoritativeThreadActive.get(threadId),
     effectiveActivity =
@@ -6603,6 +6658,10 @@ function handleBridgeEvent(event) {
       state.pendingChanges = true;
       pollActivity().catch(() => {});
     }
+    return;
+  }
+  if (event?.type === "bridge_projects_changed") {
+    scheduleProjectRefresh();
     return;
   }
   if (event?.type === "bridge_event_gap") {
@@ -7059,6 +7118,8 @@ function yieldToBrowser() {
 function resetThreadViewState(thread) {
   closeCommandPicker();
   expandedGoalThreadId = null;
+  state.rolloutModel = null;
+  state.rolloutEffort = null;
   goalStateVersion++;
   state.threadGoal = null;
   renderGoalPanel();

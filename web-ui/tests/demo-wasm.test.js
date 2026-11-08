@@ -1172,6 +1172,11 @@ test("mobile composer stays out of the message grid and catches its own pointer 
   assert.match(mobile, /\.composer-shell #submitBtn,[\s\S]*?width:\s*44px;/s);
   assert.match(mobile, /\.composer\s*\{[^}]*pointer-events:\s*auto;/s);
   assert.match(mobile, /\.composer-shell\s*\{[^}]*pointer-events:\s*auto;/s);
+  assert.match(
+    mobile,
+    /html\[lang\] \.composer:has\(\.composer-shell:focus-within\) > \.composer-status:not\(\[hidden\]\)\s*\{[^}]*display:\s*none;/s,
+  );
+  assert.doesNotMatch(mobile, /html\[lang\] \.composer:focus-within > \.composer-status/);
   assert.match(mobile, /\.composer-shell textarea,[\s\S]*?touch-action:\s*manipulation;/s);
   assert.match(
     mobile,

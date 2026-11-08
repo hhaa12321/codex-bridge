@@ -6101,7 +6101,7 @@ html[data-theme="light"] {
     margin: 0;
     padding: 0 8px;
   }
-  html[lang] .composer:focus-within > .composer-status:not([hidden]) {
+  html[lang] .composer:has(.composer-shell:focus-within) > .composer-status:not([hidden]) {
     display: none;
   }
   html[lang] .composer > .composer-status:not([hidden]) .workspace-diff,
